@@ -547,14 +547,18 @@ fn prompt_ambient_temp() -> Option<f64> {
     }
 }
 
-/// Wait for user to press Enter before closing the window
+/// Auto-close after 30 seconds with countdown, or exit early with Ctrl-C
 fn wait_for_exit() {
     println!(
         "\n  {}",
-        "Press Enter to close...".dimmed()
+        "Window will close in 30 seconds. Press Ctrl+C to exit now.".dimmed()
     );
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).ok();
+    for remaining in (1..=30).rev() {
+        print!("\r  Closing in {}s...  ", remaining);
+        io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    println!("\r  {}", "Goodbye!".green());
 }
 
 /// Open the results URL in the user's default browser

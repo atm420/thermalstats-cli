@@ -210,243 +210,241 @@ fn cpu_stress_worker(thread_id: usize, running: &AtomicBool) {
     }
 }
 
-/// GPU stress: runs heavy computation on the actual GPU using OpenCL.
-/// OpenCL.dll ships with NVIDIA, AMD, and Intel GPU drivers — no extra install needed.
-/// Falls back to memory-bandwidth CPU stress if no GPU compute is available.
-/// On macOS, OpenCL is deprecated — always uses CPU-based fallback.
+/// GPU stress: runs heavy computation on the actual GPU using wgpu (WebGPU).
+/// Maps to Vulkan on Windows/Linux, Metal on macOS, DX12 as fallback.
+/// Falls back to CPU-based FP stress if no GPU is available.
 fn start_gpu_stress(running: Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
     let mut handles = Vec::new();
 
-    #[cfg(any(windows, target_os = "linux"))]
-    {
-        // Try to initialize OpenCL with GPU device
-        match init_opencl_stress() {
-            Ok(gpu_context) => {
-                println!(
-                    "  {} Starting GPU stress (OpenCL compute on {})",
-                    "✓".green(),
-                    gpu_context.device_name.yellow()
-                );
+    match init_wgpu_stress() {
+        Ok(gpu_context) => {
+            println!(
+                "  {} Starting GPU stress (WebGPU compute on {})",
+                "✓".green(),
+                gpu_context.device_name.yellow()
+            );
 
-                let running_clone = running.clone();
-                let handle = std::thread::spawn(move || {
-                    gpu_opencl_stress_worker(&running_clone, gpu_context);
-                });
-                handles.push(handle);
-                return handles;
-            }
-            Err(e) => {
-                println!(
-                    "  {} OpenCL not available ({}), using CPU-based FP stress",
-                    "⚠".yellow(),
-                    e
-                );
-            }
+            let running_clone = running.clone();
+            let handle = std::thread::spawn(move || {
+                gpu_wgpu_stress_worker(&running_clone, gpu_context);
+            });
+            handles.push(handle);
+        }
+        Err(e) => {
+            println!(
+                "  {} WebGPU not available ({}), using CPU-based FP stress",
+                "⚠".yellow(),
+                e
+            );
+
+            let running_clone = running.clone();
+            let handle = std::thread::spawn(move || {
+                gpu_stress_worker_fallback(&running_clone);
+            });
+            handles.push(handle);
         }
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        println!(
-            "  {} GPU compute stress using CPU-based FP (OpenCL deprecated on macOS)",
-            "⚠".yellow(),
-        );
-    }
-
-    // Fallback: CPU-based FP stress
-    let running_clone = running.clone();
-    let handle = std::thread::spawn(move || {
-        gpu_stress_worker_fallback(&running_clone);
-    });
-    handles.push(handle);
 
     handles
 }
 
-#[cfg(any(windows, target_os = "linux"))]
-struct GpuComputeContext {
-    device_name: String,
-    kernel: opencl3::kernel::Kernel,
-    queue: opencl3::command_queue::CommandQueue,
-    buffer_a: opencl3::memory::Buffer<opencl3::types::cl_float>,
-    buffer_b: opencl3::memory::Buffer<opencl3::types::cl_float>,
-    buffer_c: opencl3::memory::Buffer<opencl3::types::cl_float>,
-    work_size: usize,
+// WGSL compute shader — heavy parallel workload adapted from the browser stress test.
+// Each invocation runs multiple iterations of matrix-style multiply-accumulate
+// and hash chain operations, designed to saturate GPU compute units.
+const WGSL_STRESS_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<uniform> params: vec4<f32>; // x=time, y=iteration
+
+fn hash(p: vec2<f32>) -> f32 {
+    var p2 = fract(p * vec2<f32>(443.8975, 397.2973));
+    p2 = p2 + dot(p2, p2.yx + 19.19);
+    return fract(p2.x * p2.y);
 }
 
-/// Initialize OpenCL with a heavy FP32 compute kernel
-#[cfg(any(windows, target_os = "linux"))]
-fn init_opencl_stress() -> Result<GpuComputeContext, String> {
-    use opencl3::platform::get_platforms;
-    use opencl3::device::{Device, CL_DEVICE_TYPE_GPU};
-    use opencl3::context::Context;
-    use opencl3::command_queue::{CommandQueue, CL_QUEUE_PROFILING_ENABLE};
-    use opencl3::program::Program;
-    use opencl3::kernel::Kernel;
-    use opencl3::memory::{Buffer, CL_MEM_READ_WRITE};
-    use opencl3::types::CL_NON_BLOCKING;
-
-    // OpenCL kernel: heavy FP math — trig + multiply chains per work item
-    let kernel_src = r#"
-        __kernel void stress(
-            __global float* a,
-            __global float* b,
-            __global float* c,
-            const unsigned int n,
-            const float seed
-        ) {
-            int gid = get_global_id(0);
-            if (gid >= n) return;
-
-            float x = a[gid];
-            float y = b[gid];
-            float z = c[gid];
-
-            // Heavy FP math loop — 256 iterations of trig + multiply chains
-            for (int i = 0; i < 256; i++) {
-                float fi = (float)i * 0.001f + seed;
-                x = mad(sin(x + fi), cos(y + fi), z);
-                y = mad(cos(y + fi), sin(z + fi), x);
-                z = mad(sin(z + fi), cos(x + fi), y);
-                x = mad(x, 0.9999f, y * 0.0001f);
-                y = mad(y, 0.9999f, z * 0.0001f);
-                z = mad(z, 0.9999f, x * 0.0001f);
-                x = mad(tan(x * 0.01f), 0.01f, x);
-                y = mad(atan(y), 0.01f, y);
-                z = mad(sqrt(fabs(z) + 1.0f), 0.01f, z - 0.01f);
-            }
-
-            a[gid] = x;
-            b[gid] = y;
-            c[gid] = z;
-        }
-    "#;
-
-    let platforms = get_platforms().map_err(|e| format!("No OpenCL platforms: {:?}", e))?;
-    if platforms.is_empty() {
-        return Err("No OpenCL platforms found".into());
+fn heavy_compute(seed: f32, t: f32) -> f32 {
+    var acc: f32 = seed;
+    for (var i: u32 = 0u; i < 64u; i = i + 1u) {
+        let fi = f32(i);
+        let h = hash(vec2<f32>(acc + fi, t + fi * 0.1));
+        let a = sin(acc * 1.7 + h * 6.283) * cos(fi * 0.1 + t);
+        let b = cos(acc * 2.3 - h * 3.141) * sin(fi * 0.13 - t * 0.7);
+        let c = sin(a * b + h) * cos(a - b);
+        let d = fma(a, b, c) * fma(c, h, a);
+        acc = fract(acc + d * 0.01 + a * b * 0.001);
+        acc = fma(acc, 1.0001, sin(acc * 12.9898 + fi) * 0.0001);
+        acc = fma(acc, 0.9999, cos(acc * 78.233 + t) * 0.0001);
     }
+    return acc;
+}
 
-    // Find a GPU device across all platforms
-    let mut gpu_device: Option<Device> = None;
-    for platform in &platforms {
-        if let Ok(devices) = platform.get_devices(CL_DEVICE_TYPE_GPU) {
-            for dev_id in devices {
-                let dev = Device::new(dev_id);
-                gpu_device = Some(dev);
-                break;
-            }
-            if gpu_device.is_some() { break; }
-        }
-    }
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let size = arrayLength(&data);
+    if (idx >= size) { return; }
 
-    let device = gpu_device.ok_or("No GPU OpenCL device found")?;
-    let device_name = device.name().map_err(|e| format!("Can't read device name: {:?}", e))?;
+    let t = params.x;
+    let iter = params.y;
+    let seed = data[idx] + f32(idx) * 0.0001 + iter * 0.001;
 
-    let context = Context::from_device(&device)
-        .map_err(|e| format!("Context: {:?}", e))?;
+    var result = heavy_compute(seed, t);
+    result = result + heavy_compute(result + t * 0.3, t * 1.3) * 0.5;
+    result = result + heavy_compute(result * 0.7 + iter, t * 0.7) * 0.25;
 
-    let queue = CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)
-        .map_err(|e| format!("Queue: {:?}", e))?;
+    data[idx] = fract(result);
+}
+"#;
 
-    let program = Program::create_and_build_from_source(&context, kernel_src, "")
-        .map_err(|e| format!("Program build: {:?}", e))?;
+struct WgpuComputeContext {
+    device_name: String,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params_buffer: wgpu::Buffer,
+    work_groups: u32,
+}
 
-    let kernel = Kernel::create(&program, "stress")
-        .map_err(|e| format!("Kernel: {:?}", e))?;
+/// Initialize wgpu with a compute pipeline for GPU stress
+fn init_wgpu_stress() -> Result<WgpuComputeContext, String> {
+    use wgpu::*;
+    use wgpu::util::DeviceExt;
 
-    // 16M work items
-    let work_size: usize = 16 * 1024 * 1024;
-    let init_a = vec![1.0f32; work_size];
-    let init_b = vec![0.5f32; work_size];
-    let init_c = vec![0.25f32; work_size];
+    let instance = Instance::new(&InstanceDescriptor {
+        backends: Backends::VULKAN | Backends::METAL,
+        ..Default::default()
+    });
 
-    let mut buffer_a = unsafe {
-        Buffer::<opencl3::types::cl_float>::create(&context, CL_MEM_READ_WRITE, work_size, std::ptr::null_mut())
-            .map_err(|e| format!("Buffer A: {:?}", e))?
-    };
-    let mut buffer_b = unsafe {
-        Buffer::<opencl3::types::cl_float>::create(&context, CL_MEM_READ_WRITE, work_size, std::ptr::null_mut())
-            .map_err(|e| format!("Buffer B: {:?}", e))?
-    };
-    let mut buffer_c = unsafe {
-        Buffer::<opencl3::types::cl_float>::create(&context, CL_MEM_READ_WRITE, work_size, std::ptr::null_mut())
-            .map_err(|e| format!("Buffer C: {:?}", e))?
-    };
+    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .map_err(|e| format!("No GPU adapter found: {}", e))?;
 
-    // Upload initial data
-    unsafe {
-        queue.enqueue_write_buffer(&mut buffer_a, CL_NON_BLOCKING, 0, &init_a, &[])
-            .map_err(|e| format!("Write A: {:?}", e))?;
-        queue.enqueue_write_buffer(&mut buffer_b, CL_NON_BLOCKING, 0, &init_b, &[])
-            .map_err(|e| format!("Write B: {:?}", e))?;
-        queue.enqueue_write_buffer(&mut buffer_c, CL_NON_BLOCKING, 0, &init_c, &[])
-            .map_err(|e| format!("Write C: {:?}", e))?;
-    }
-    queue.finish().map_err(|e| format!("Queue finish: {:?}", e))?;
+    let device_name = adapter.get_info().name;
 
-    Ok(GpuComputeContext {
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &DeviceDescriptor {
+            label: Some("thermalstats-stress"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        },
+    ))
+    .map_err(|e| format!("Device request failed: {}", e))?;
+
+    let shader_module: ShaderModule = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("stress-shader"),
+        source: ShaderSource::Wgsl(WGSL_STRESS_SHADER.into()),
+    });
+
+    let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("stress-pipeline"),
+        layout: None,
+        module: &shader_module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // 4M elements (16 MB) — large enough to saturate GPU
+    let work_size: u64 = 4 * 1024 * 1024;
+
+    // Initialize data buffer
+    let init_data: Vec<f32> = (0..work_size).map(|i| (i as f32 * 0.0001).fract()).collect();
+
+    let data_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+        label: Some("data-buffer"),
+        contents: bytemuck::cast_slice(&init_data),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
+    let params_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("params-buffer"),
+        size: 16, // vec4<f32>
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("stress-bind-group"),
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: data_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // 256 threads per workgroup
+    let work_groups = (work_size as u32 + 255) / 256;
+
+    Ok(WgpuComputeContext {
         device_name,
-        kernel,
+        device,
         queue,
-        buffer_a,
-        buffer_b,
-        buffer_c,
-        work_size,
+        pipeline,
+        bind_group,
+        params_buffer,
+        work_groups,
     })
 }
 
-/// Run the OpenCL stress kernel in a loop until stopped
-#[cfg(any(windows, target_os = "linux"))]
-fn gpu_opencl_stress_worker(running: &AtomicBool, ctx: GpuComputeContext) {
-    use opencl3::kernel::ExecuteKernel;
-
+/// Run the wgpu stress compute shader in a loop until stopped
+fn gpu_wgpu_stress_worker(running: &AtomicBool, ctx: WgpuComputeContext) {
     let mut iteration = 0u32;
-    let n = ctx.work_size as u32;
+    let start = std::time::Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        let seed = (iteration as f32) * 0.001;
+        let elapsed = start.elapsed().as_secs_f32();
+        let params = [elapsed, iteration as f32, 0.0f32, 0.0f32];
+        ctx.queue.write_buffer(&ctx.params_buffer, 0, bytemuck::cast_slice(&params));
 
-        let result = unsafe {
-            ExecuteKernel::new(&ctx.kernel)
-                .set_arg(&ctx.buffer_a)
-                .set_arg(&ctx.buffer_b)
-                .set_arg(&ctx.buffer_c)
-                .set_arg(&n)
-                .set_arg(&seed)
-                .set_global_work_size(ctx.work_size)
-                .enqueue_nd_range(&ctx.queue)
-        };
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("stress-encoder"),
+        });
 
-        if result.is_err() {
-            break;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("stress-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.pipeline);
+            pass.set_bind_group(0, &ctx.bind_group, &[]);
+            // Dispatch multiple times per submission for sustained load
+            for _ in 0..16 {
+                pass.dispatch_workgroups(ctx.work_groups, 1, 1);
+            }
         }
 
-        // Wait for GPU to finish this batch
-        if ctx.queue.finish().is_err() {
-            break;
-        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        ctx.device.poll(wgpu::PollType::Wait).ok();
 
         iteration = iteration.wrapping_add(1);
     }
 }
 
-/// Fallback GPU stress for non-NVIDIA systems — pure CPU FP stress
+/// Fallback GPU stress — pure CPU FP stress when no GPU is available
 fn gpu_stress_worker_fallback(running: &AtomicBool) {
-    // Large buffer to simulate GPU memory bandwidth stress
-    const SIZE: usize = 4 * 1024 * 1024; // 32 MB of f64
+    const SIZE: usize = 4 * 1024 * 1024;
     let mut buf_a = vec![1.0001f64; SIZE];
     let mut buf_b = vec![0.9999f64; SIZE];
 
     let mut iteration = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        // SAXPY-style operation over large arrays (memory bandwidth heavy)
         let alpha = f64::sin(iteration as f64 * 0.0001) * 0.5 + 1.0;
         for i in 0..SIZE {
             buf_a[i] = buf_a[i].mul_add(alpha, buf_b[i]);
             buf_b[i] = f64::sin(buf_a[i] * 0.0001) * f64::cos(buf_b[i] * 0.0001) + 0.5;
-            // Prevent values from growing unbounded
             if i & 0xFFFF == 0 {
                 buf_a[i] = buf_a[i].fract() + 1.0;
                 buf_b[i] = buf_b[i].fract() + 1.0;

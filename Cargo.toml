@@ -39,19 +39,17 @@ rand = "0.8"
 # Number of CPUs (logical cores)
 num_cpus = "1"
 
+# WebGPU for cross-platform GPU compute stress (Vulkan/Metal/DX12)
+wgpu = { version = "25", default-features = false, features = ["wgsl", "vulkan", "metal"] }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
 [target.'cfg(windows)'.dependencies]
 # WMI for reading GPU info and temperatures on Windows
 wmi = "0.14"
 
-# OpenCL for real GPU compute stress on Windows (dynamic loading, no SDK needed)
-opencl3 = { version = "0.9", features = ["CL_VERSION_1_2"] }
-
 # Zip extraction for embedded LHM bundle
 zip = { version = "2", default-features = false, features = ["deflate"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# OpenCL for GPU stress on Linux (AMD/NVIDIA/Intel)
-opencl3 = { version = "0.9", features = ["CL_VERSION_1_2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Core Foundation for IOKit-based temp reading
