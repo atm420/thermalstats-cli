@@ -96,18 +96,30 @@ jobs:
         run: ls -laR artifacts/
 
       - name: Set up SSH key
+        env:
+          DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          echo "$DROPLET_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$DROPLET_HOST" >> ~/.ssh/known_hosts
+
+          # Create SSH config so all commands use the right key/options
+          cat >> ~/.ssh/config << SSHEOF
+          Host deploy-target
+            HostName $DROPLET_HOST
+            User $DROPLET_USER
+            IdentityFile ~/.ssh/deploy_key
+            ServerAliveInterval 30
+            ServerAliveCountMax 10
+            StrictHostKeyChecking no
+          SSHEOF
+          chmod 600 ~/.ssh/config
 
       - name: Deploy binaries to server
         run: |
-          SSH_CMD="ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
-          SCP_CMD="scp -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
-          SERVER="${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }}"
-
           # Create a staging directory with the binaries
           mkdir -p deploy_binaries
           cp artifacts/thermalstats.exe/thermalstats.exe deploy_binaries/
@@ -117,16 +129,20 @@ jobs:
           chmod +x deploy_binaries/thermalstats-macos
 
           # Ensure target directories exist on the server
-          $SSH_CMD "$SERVER" "mkdir -p /opt/thermalstats/standalone/public/downloads /opt/thermalstats/app/public/downloads"
+          ssh deploy-target "mkdir -p /opt/thermalstats/standalone/public/downloads /opt/thermalstats/app/public/downloads"
 
           echo "==> Uploading binaries to server..."
-          $SCP_CMD deploy_binaries/* "$SERVER":/opt/thermalstats/standalone/public/downloads/
+          scp deploy_binaries/thermalstats.exe deploy-target:/opt/thermalstats/standalone/public/downloads/
+          scp deploy_binaries/thermalstats-linux deploy-target:/opt/thermalstats/standalone/public/downloads/
+          scp deploy_binaries/thermalstats-macos deploy-target:/opt/thermalstats/standalone/public/downloads/
 
           # Also update the source copy so future Next.js rebuilds include them
-          $SCP_CMD deploy_binaries/* "$SERVER":/opt/thermalstats/app/public/downloads/
+          scp deploy_binaries/thermalstats.exe deploy-target:/opt/thermalstats/app/public/downloads/
+          scp deploy_binaries/thermalstats-linux deploy-target:/opt/thermalstats/app/public/downloads/
+          scp deploy_binaries/thermalstats-macos deploy-target:/opt/thermalstats/app/public/downloads/
 
           # Ensure Linux/macOS binaries are executable on the server
-          $SSH_CMD "$SERVER" "chmod +x /opt/thermalstats/standalone/public/downloads/thermalstats-linux /opt/thermalstats/standalone/public/downloads/thermalstats-macos /opt/thermalstats/app/public/downloads/thermalstats-linux /opt/thermalstats/app/public/downloads/thermalstats-macos"
+          ssh deploy-target "chmod +x /opt/thermalstats/standalone/public/downloads/thermalstats-linux /opt/thermalstats/standalone/public/downloads/thermalstats-macos /opt/thermalstats/app/public/downloads/thermalstats-linux /opt/thermalstats/app/public/downloads/thermalstats-macos"
 
           echo "==> Binaries deployed successfully!"
 
