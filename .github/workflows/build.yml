@@ -1,7 +1,22 @@
+# ──────────────────────────────────────────────────────────────────
+# ThermalStats CLI — Build, Release & Deploy
+#
+# Builds all platform binaries on every push to main or on tag.
+# - Push to main  → builds + deploys binaries to Digital Ocean
+# - Tag v*        → builds + creates GitHub Release + deploys
+# - Manual        → builds + deploys
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   DROPLET_HOST    — Server IP (e.g. 167.99.186.82)
+#   DROPLET_USER    — SSH user (e.g. root)
+#   DROPLET_SSH_KEY — Private SSH key (paste full key including BEGIN/END lines)
+# ──────────────────────────────────────────────────────────────────
+
 name: Build & Release CLI
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -66,6 +81,54 @@ jobs:
           path: ${{ matrix.artifact }}
           retention-days: 90
 
+  # Deploy binaries to the Digital Ocean droplet on every main push or manual trigger
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -laR artifacts/
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy binaries to server
+        run: |
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+          SERVER="${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }}"
+
+          # Create a staging directory with the binaries
+          mkdir -p deploy_binaries
+          cp artifacts/thermalstats.exe/thermalstats.exe deploy_binaries/
+          cp artifacts/thermalstats-linux/thermalstats-linux deploy_binaries/
+          cp artifacts/thermalstats-macos/thermalstats-macos deploy_binaries/
+          chmod +x deploy_binaries/thermalstats-linux
+          chmod +x deploy_binaries/thermalstats-macos
+
+          echo "==> Uploading binaries to server..."
+          rsync -avz -e "$SSH_CMD" \
+            deploy_binaries/ \
+            "$SERVER":/opt/thermalstats/standalone/public/downloads/
+
+          # Also update the source copy so future Next.js rebuilds include them
+          $SSH_CMD "$SERVER" "mkdir -p /opt/thermalstats/app/public/downloads"
+          rsync -avz -e "$SSH_CMD" \
+            deploy_binaries/ \
+            "$SERVER":/opt/thermalstats/app/public/downloads/
+
+          echo "==> Binaries deployed successfully!"
+
+  # Create a GitHub Release when a version tag is pushed
   release:
     needs: build
     runs-on: ubuntu-latest
