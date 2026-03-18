@@ -115,13 +115,15 @@ jobs:
           chmod +x deploy_binaries/thermalstats-linux
           chmod +x deploy_binaries/thermalstats-macos
 
+          # Ensure target directories exist on the server
+          $SSH_CMD "$SERVER" "mkdir -p /opt/thermalstats/standalone/public/downloads /opt/thermalstats/app/public/downloads"
+
           echo "==> Uploading binaries to server..."
           rsync -avz -e "$SSH_CMD" \
             deploy_binaries/ \
             "$SERVER":/opt/thermalstats/standalone/public/downloads/
 
           # Also update the source copy so future Next.js rebuilds include them
-          $SSH_CMD "$SERVER" "mkdir -p /opt/thermalstats/app/public/downloads"
           rsync -avz -e "$SSH_CMD" \
             deploy_binaries/ \
             "$SERVER":/opt/thermalstats/app/public/downloads/
