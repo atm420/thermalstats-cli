@@ -7,6 +7,7 @@ pub struct HardwareInfo {
     pub gpu_model: Option<String>,
     pub gpu_vram: Option<String>,
     pub os: Option<String>,
+    pub is_laptop: bool,
 }
 
 pub fn detect_hardware() -> HardwareInfo {
@@ -28,12 +29,15 @@ pub fn detect_hardware() -> HardwareInfo {
     // GPU detection (platform-specific)
     let (gpu_model, gpu_vram) = detect_gpu();
 
+    let is_laptop = detect_is_laptop(cpu_model.as_deref(), gpu_model.as_deref());
+
     HardwareInfo {
         cpu_model,
         cpu_cores,
         gpu_model,
         gpu_vram,
         os,
+        is_laptop,
     }
 }
 
@@ -372,4 +376,119 @@ fn detect_gpu() -> (Option<String>, Option<String>) {
     }
 
     (None, None)
+}
+
+/// Detect whether the system is a laptop based on CPU and GPU names.
+///
+/// Laptop indicators:
+/// - CPU: AMD mobile suffixes (H, HX, HS, U), Intel mobile suffixes (H, HX, HK),
+///   Intel Core Ultra mobile (H suffix), Apple Silicon (always laptop-capable)
+/// - GPU: "Laptop GPU" in name, AMD mobile GPU suffixes (M, S)
+/// - System: macOS is assumed laptop for Apple Silicon (most common case)
+fn detect_is_laptop(cpu: Option<&str>, gpu: Option<&str>) -> bool {
+    // GPU-based detection (most reliable)
+    if let Some(g) = gpu {
+        let gl = g.to_lowercase();
+        if gl.contains("laptop gpu") {
+            return true;
+        }
+        // AMD mobile GPUs: RX 7900M, RX 7700S, RX 7600M XT, etc.
+        if gl.contains("radeon") {
+            // Match patterns like "7900M", "7700S", "6600M"
+            for part in g.split_whitespace() {
+                let p = part.trim_end_matches(|c: char| c == ',' || c == ')');
+                if p.len() >= 4 && p.ends_with('M') || p.ends_with('S') {
+                    if p[..p.len()-1].chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // CPU-based detection
+    if let Some(c) = cpu {
+        // AMD Ryzen mobile: H, HX, HS, U suffixes after 4-digit model number
+        // e.g. "AMD Ryzen 9 7945HX", "AMD Ryzen 7 7840U"
+        if c.contains("Ryzen") {
+            for part in c.split_whitespace() {
+                if part.len() >= 5 {
+                    let suffix = &part[part.len().saturating_sub(2)..];
+                    if suffix == "HX" || suffix == "HS" {
+                        return true;
+                    }
+                }
+                if part.len() >= 5 && (part.ends_with('H') || part.ends_with('U')) {
+                    // Check the preceding chars are digits (model number)
+                    let prefix = &part[..part.len()-1];
+                    if prefix.chars().last().map_or(false, |c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Intel mobile: i7-13700H, i9-13950HX, i5-12500H, etc.
+        if c.contains("Intel") {
+            for part in c.split_whitespace() {
+                if part.contains('-') && (part.ends_with('H') || part.ends_with("HX") || part.ends_with("HK")) {
+                    return true;
+                }
+            }
+            // Intel Core Ultra mobile: "185H", "165H", etc.
+            if c.contains("Ultra") {
+                for part in c.split_whitespace() {
+                    if part.ends_with('H') && part.len() >= 3 {
+                        let num_part = &part[..part.len()-1];
+                        if num_part.chars().all(|c| c.is_ascii_digit()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apple Silicon — all are laptop-capable, detect via macOS
+        if c.starts_with("Apple M") {
+            #[cfg(target_os = "macos")]
+            return true;
+        }
+    }
+
+    // Platform-level battery detection (fallback)
+    #[cfg(windows)]
+    {
+        if has_battery_windows() {
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Check for battery in /sys/class/power_supply/
+        if std::path::Path::new("/sys/class/power_supply/BAT0").exists()
+            || std::path::Path::new("/sys/class/power_supply/BAT1").exists()
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check for battery presence on Windows via WMI
+#[cfg(windows)]
+fn has_battery_windows() -> bool {
+    use std::process::Command;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+            "(Get-WmiObject -Class Win32_Battery).Count"])
+        .output();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Ok(count) = stdout.trim().parse::<i32>() {
+            return count > 0;
+        }
+    }
+    false
 }

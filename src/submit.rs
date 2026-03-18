@@ -12,6 +12,8 @@ pub struct SubmissionPayload {
     pub gpu_model: Option<String>,
     pub gpu_vram: Option<String>,
     pub os: Option<String>,
+    pub device_type: Option<String>,
+    pub laptop_model: Option<String>,
     pub cooling_type: Option<String>,
     pub cooling_model: Option<String>,
     pub ambient_temp: Option<f64>,

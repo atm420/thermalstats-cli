@@ -99,6 +99,16 @@ async fn main() -> Result<()> {
     let hw = hardware::detect_hardware();
     print_hardware(&hw);
 
+    // Detect device type (laptop vs desktop)
+    let is_laptop = hw.is_laptop;
+    if is_laptop {
+        println!(
+            "  {} {}",
+            "💻".normal(),
+            "Laptop detected".cyan().bold()
+        );
+    }
+
     if cli.detect_only {
         wait_for_exit();
         return Ok(());
@@ -115,16 +125,27 @@ async fn main() -> Result<()> {
         None => prompt_duration(),
     };
 
-    // Interactive prompts for cooling & ambient info (if not provided via CLI flags)
-    let cooling_type = match cli.cooling_type {
-        Some(ct) => Some(ct),
-        None => prompt_cooling_type(),
-    };
+    // Laptop: ask for laptop model, default cooling to stock
+    // Desktop: ask for cooling type and cooler model
+    let laptop_model: Option<String>;
+    let cooling_type: Option<String>;
+    let cooling_model: Option<String>;
 
-    let cooling_model = match cli.cooling_model {
-        Some(cm) => Some(cm),
-        None => prompt_cooling_model(),
-    };
+    if is_laptop {
+        laptop_model = prompt_laptop_model();
+        cooling_type = cli.cooling_type.or(Some("stock".to_string()));
+        cooling_model = cli.cooling_model;
+    } else {
+        laptop_model = None;
+        cooling_type = match cli.cooling_type {
+            Some(ct) => Some(ct),
+            None => prompt_cooling_type(),
+        };
+        cooling_model = match cli.cooling_model {
+            Some(cm) => Some(cm),
+            None => prompt_cooling_model(),
+        };
+    }
 
     let ambient_temp = match cli.ambient_temp {
         Some(at) => Some(at),
@@ -246,6 +267,9 @@ async fn main() -> Result<()> {
         };
         println!("  Cooling: {}", label);
     }
+    if let Some(ref lm) = laptop_model {
+        println!("  Laptop:  {}", lm);
+    }
     if let Some(ref cm) = cooling_model {
         println!("  Cooler:  {}", cm);
     }
@@ -283,6 +307,8 @@ async fn main() -> Result<()> {
             gpu_model: hw.gpu_model.clone(),
             gpu_vram: hw.gpu_vram.clone(),
             os: hw.os.clone(),
+            device_type: Some(if is_laptop { "laptop" } else { "desktop" }.to_string()),
+            laptop_model: laptop_model.clone(),
             cooling_type: cooling_type.clone(),
             cooling_model: cooling_model.clone(),
             ambient_temp: ambient_temp,
@@ -454,6 +480,26 @@ fn prompt_duration() -> u64 {
             }
         }
         _ => 120, // default: recommended
+    }
+}
+
+/// Prompt user for laptop model name (free text, optional)
+fn prompt_laptop_model() -> Option<String> {
+    println!("\n{}", "\u{25b8} What laptop model do you have? (optional)".cyan().bold());
+    println!(
+        "  {}",
+        "e.g. ASUS ROG Zephyrus G14, Dell XPS 15, Lenovo Legion 5 Pro".dimmed()
+    );
+    print!("  Laptop model (Enter to skip): ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
