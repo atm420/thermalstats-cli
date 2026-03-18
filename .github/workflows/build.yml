@@ -105,6 +105,7 @@ jobs:
       - name: Deploy binaries to server
         run: |
           SSH_CMD="ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+          SCP_CMD="scp -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
           SERVER="${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }}"
 
           # Create a staging directory with the binaries
@@ -119,14 +120,13 @@ jobs:
           $SSH_CMD "$SERVER" "mkdir -p /opt/thermalstats/standalone/public/downloads /opt/thermalstats/app/public/downloads"
 
           echo "==> Uploading binaries to server..."
-          rsync -avz -e "$SSH_CMD" \
-            deploy_binaries/ \
-            "$SERVER":/opt/thermalstats/standalone/public/downloads/
+          $SCP_CMD deploy_binaries/* "$SERVER":/opt/thermalstats/standalone/public/downloads/
 
           # Also update the source copy so future Next.js rebuilds include them
-          rsync -avz -e "$SSH_CMD" \
-            deploy_binaries/ \
-            "$SERVER":/opt/thermalstats/app/public/downloads/
+          $SCP_CMD deploy_binaries/* "$SERVER":/opt/thermalstats/app/public/downloads/
+
+          # Ensure Linux/macOS binaries are executable on the server
+          $SSH_CMD "$SERVER" "chmod +x /opt/thermalstats/standalone/public/downloads/thermalstats-linux /opt/thermalstats/standalone/public/downloads/thermalstats-macos /opt/thermalstats/app/public/downloads/thermalstats-linux /opt/thermalstats/app/public/downloads/thermalstats-macos"
 
           echo "==> Binaries deployed successfully!"
 
