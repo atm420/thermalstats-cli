@@ -45,7 +45,7 @@ struct Cli {
     #[arg(long)]
     detect_only: bool,
 
-    /// Cooling type: air, aio, custom_loop, stock
+    /// Cooling type: stock, air, aio, custom_loop, passive, other
     #[arg(long)]
     cooling_type: Option<String>,
 
@@ -81,9 +81,9 @@ async fn main() -> Result<()> {
 
     // Validate cooling type if provided
     if let Some(ref ct) = cli.cooling_type {
-        if !["air", "aio", "custom_loop", "stock"].contains(&ct.as_str()) {
+        if !["air", "aio", "custom_loop", "stock", "passive", "other"].contains(&ct.as_str()) {
             eprintln!(
-                "{} Invalid cooling type '{}'. Use: air, aio, custom_loop, or stock",
+                "{} Invalid cooling type '{}'. Use: stock, air, aio, custom_loop, passive, or other",
                 "Error:".red().bold(),
                 ct
             );
@@ -113,6 +113,22 @@ async fn main() -> Result<()> {
     let duration_secs = match cli.duration {
         Some(d) => d,
         None => prompt_duration(),
+    };
+
+    // Interactive prompts for cooling & ambient info (if not provided via CLI flags)
+    let cooling_type = match cli.cooling_type {
+        Some(ct) => Some(ct),
+        None => prompt_cooling_type(),
+    };
+
+    let cooling_model = match cli.cooling_model {
+        Some(cm) => Some(cm),
+        None => prompt_cooling_model(),
+    };
+
+    let ambient_temp = match cli.ambient_temp {
+        Some(at) => Some(at),
+        None => prompt_ambient_temp(),
     };
 
     // Extract embedded LibreHardwareMonitor for accurate CPU die temps
@@ -218,6 +234,24 @@ async fn main() -> Result<()> {
     if let Some(gpu_usage) = stress_result.gpu_usage_max {
         println!("  GPU Max Usage: {:.0}%", gpu_usage);
     }
+    if let Some(ref ct) = cooling_type {
+        let label = match ct.as_str() {
+            "stock" => "Stock Cooler",
+            "air" => "Aftermarket Air",
+            "aio" => "AIO Liquid",
+            "custom_loop" => "Custom Loop",
+            "passive" => "Passive / Fanless",
+            "other" => "Other",
+            _ => ct.as_str(),
+        };
+        println!("  Cooling: {}", label);
+    }
+    if let Some(ref cm) = cooling_model {
+        println!("  Cooler:  {}", cm);
+    }
+    if let Some(at) = ambient_temp {
+        println!("  Ambient: {:.1}°C", at);
+    }
     println!("{}", "━".repeat(50).dimmed());
 
     // Detect stale CPU temp (board sensor didn't change during stress)
@@ -249,9 +283,9 @@ async fn main() -> Result<()> {
             gpu_model: hw.gpu_model.clone(),
             gpu_vram: hw.gpu_vram.clone(),
             os: hw.os.clone(),
-            cooling_type: cli.cooling_type.clone(),
-            cooling_model: cli.cooling_model.clone(),
-            ambient_temp: cli.ambient_temp,
+            cooling_type: cooling_type.clone(),
+            cooling_model: cooling_model.clone(),
+            ambient_temp: ambient_temp,
             cpu_temp_idle: idle_temps.cpu_temp,
             cpu_temp_load: final_load_temps.cpu_temp,
             gpu_temp_idle: idle_temps.gpu_temp,
@@ -420,6 +454,96 @@ fn prompt_duration() -> u64 {
             }
         }
         _ => 120, // default: recommended
+    }
+}
+
+/// Prompt user to choose cooling system type
+fn prompt_cooling_type() -> Option<String> {
+    println!("\n{}", "\u{25b8} What type of CPU cooling do you use?".cyan().bold());
+    println!("  {} Stock Cooler", "[1]".yellow());
+    println!("  {} Aftermarket Air Cooler", "[2]".yellow());
+    println!("  {} AIO Liquid Cooler", "[3]".yellow());
+    println!("  {} Custom Water Loop", "[4]".yellow());
+    println!("  {} Passive / Fanless", "[5]".yellow());
+    println!("  {} Other", "[6]".yellow());
+    println!("  {} Skip", "[Enter]".dimmed());
+    print!("\n  Enter choice (1-6) or Enter to skip: ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    match input.trim() {
+        "1" => Some("stock".to_string()),
+        "2" => Some("air".to_string()),
+        "3" => Some("aio".to_string()),
+        "4" => Some("custom_loop".to_string()),
+        "5" => Some("passive".to_string()),
+        "6" => Some("other".to_string()),
+        _ => None,
+    }
+}
+
+/// Prompt user for cooler model name (free text, optional)
+fn prompt_cooling_model() -> Option<String> {
+    println!("\n{}", "\u{25b8} What cooler model do you have? (optional)".cyan().bold());
+    println!(
+        "  {}",
+        "e.g. Noctua NH-D15, Corsair H150i, be quiet! Dark Rock Pro 4".dimmed()
+    );
+    print!("  Cooler model (Enter to skip): ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Prompt user for ambient room temperature (optional, accepts C or F)
+fn prompt_ambient_temp() -> Option<f64> {
+    println!("\n{}", "\u{25b8} What\u{2019}s your ambient room temperature? (optional)".cyan().bold());
+    println!(
+        "  {}",
+        "Enter a number in \u{00b0}C or add 'f' for Fahrenheit (e.g. 22, 72f)".dimmed()
+    );
+    print!("  Room temp (Enter to skip): ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    let trimmed = input.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(f_str) = trimmed.strip_suffix('f') {
+        // Fahrenheit input — convert to Celsius
+        if let Ok(f) = f_str.trim().parse::<f64>() {
+            let celsius = (f - 32.0) * 5.0 / 9.0;
+            let rounded = (celsius * 10.0).round() / 10.0;
+            println!(
+                "  {} {:.1}\u{00b0}F \u{2192} {:.1}\u{00b0}C",
+                "\u{2192}".dimmed(),
+                f,
+                rounded
+            );
+            Some(rounded)
+        } else {
+            println!("  {} Couldn't parse temperature, skipping.", "\u{26a0}".yellow());
+            None
+        }
+    } else {
+        // Celsius input
+        if let Ok(c) = trimmed.parse::<f64>() {
+            Some((c * 10.0).round() / 10.0)
+        } else {
+            println!("  {} Couldn't parse temperature, skipping.", "\u{26a0}".yellow());
+            None
+        }
     }
 }
 
