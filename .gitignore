@@ -1,0 +1,19 @@
+# Build output
+target/
+
+# LHM extracted/test artifacts
+lhm/extracted/
+lhm/test-full/
+lhm/bundle/
+lhm/LibreHardwareMonitor.zip
+lhm/*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,64 @@
+[package]
+name = "thermalstats"
+version = "0.1.0"
+edition = "2021"
+description = "ThermalStats CLI — stress test your CPU/GPU and submit real temperatures"
+license = "MIT"
+
+[[bin]]
+name = "thermalstats"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for submitting results
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# JSON serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# System info (CPU model, cores, OS, etc.)
+sysinfo = "0.32"
+
+# Pretty terminal output
+colored = "2"
+indicatif = { version = "0.17", features = ["tokio"] }
+
+# Error handling
+anyhow = "1"
+
+# Random number generation (for stress test variation)
+rand = "0.8"
+
+# Number of CPUs (logical cores)
+num_cpus = "1"
+
+[target.'cfg(windows)'.dependencies]
+# WMI for reading GPU info and temperatures on Windows
+wmi = "0.14"
+
+# OpenCL for real GPU compute stress on Windows (dynamic loading, no SDK needed)
+opencl3 = { version = "0.9", features = ["CL_VERSION_1_2"] }
+
+# Zip extraction for embedded LHM bundle
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# OpenCL for GPU stress on Linux (AMD/NVIDIA/Intel)
+opencl3 = { version = "0.9", features = ["CL_VERSION_1_2"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Core Foundation for IOKit-based temp reading
+core-foundation = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
