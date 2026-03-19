@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-const LHM_VERSION: &str = "0.9.6+pawnio";
+const LHM_VERSION: &str = "0.9.6";
 
 // The LHM bundle zip is embedded at compile time
 const LHM_BUNDLE: &[u8] = include_bytes!("../lhm/lhm-bundle.zip");
@@ -15,7 +15,7 @@ fn lhm_dir() -> Option<PathBuf> {
     Some(PathBuf::from(appdata).join("ThermalStats").join("lhm"))
 }
 
-/// Ensure LHM files are extracted and PawnIO driver is installed.
+/// Ensure LHM files are extracted.
 /// Returns the directory path if successful.
 pub fn ensure_extracted() -> Option<PathBuf> {
     let dir = lhm_dir()?;
@@ -25,8 +25,6 @@ pub fn ensure_extracted() -> Option<PathBuf> {
     if version_file.exists() {
         if let Ok(v) = std::fs::read_to_string(&version_file) {
             if v.trim() == LHM_VERSION {
-                // Already up to date — ensure driver is installed
-                ensure_pawnio_driver(&dir);
                 return Some(dir);
             }
         }
@@ -38,50 +36,10 @@ pub fn ensure_extracted() -> Option<PathBuf> {
         return None;
     }
 
-    // Install PawnIO kernel driver (required for CPU MSR access)
-    ensure_pawnio_driver(&dir);
-
     // Write version marker
     let _ = std::fs::write(&version_file, LHM_VERSION);
 
     Some(dir)
-}
-
-/// Install the PawnIO kernel driver if not already running.
-/// This is required for LibreHardwareMonitor to read CPU die temperatures via MSR.
-fn ensure_pawnio_driver(dir: &PathBuf) {
-    let setup_exe = dir.join("PawnIO_setup.exe");
-    if !setup_exe.exists() {
-        return;
-    }
-
-    // Check if PawnIO service is already running
-    let check = std::process::Command::new("sc.exe")
-        .args(["query", "PawnIO"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    if let Ok(output) = check {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("RUNNING") {
-            return; // Driver already active
-        }
-    }
-
-    // Install the driver silently
-    let mut cmd = std::process::Command::new(&setup_exe);
-    cmd.current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    let _ = cmd.output();
 }
 
 fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -103,6 +61,10 @@ fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         }
         let allowed_ext = [".exe", ".dll"];
         if !allowed_ext.iter().any(|ext| name.to_lowercase().ends_with(ext)) {
+            continue;
+        }
+        // Skip PawnIO installer — not needed
+        if name.to_lowercase().contains("pawnio") {
             continue;
         }
 
