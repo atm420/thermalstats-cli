@@ -12,7 +12,15 @@ pub struct StressResult {
     pub gpu_temp_peak: Option<f64>,
 }
 
-pub async fn run_stress_test(test_type: &str, duration: Duration, lhm_dir: Option<&std::path::PathBuf>) -> StressResult {
+pub async fn run_stress_test(
+    test_type: &str,
+    duration: Duration,
+    lhm_dir: Option<&std::path::PathBuf>,
+    msg_spawned_threads: &str,
+    msg_starting_gpu: &str,
+    msg_webgpu_fallback: &str,
+    msg_complete: &str,
+) -> StressResult {
     let running = Arc::new(AtomicBool::new(true));
     let mut cpu_usage_max: Option<f64> = None;
     let mut gpu_usage_max: Option<f64> = None;
@@ -37,7 +45,7 @@ pub async fn run_stress_test(test_type: &str, duration: Duration, lhm_dir: Optio
     // Start CPU stress threads
     let cpu_handles = if test_type == "cpu" || test_type == "both" {
         let running_clone = running.clone();
-        Some(start_cpu_stress(running_clone))
+        Some(start_cpu_stress(running_clone, msg_spawned_threads))
     } else {
         None
     };
@@ -45,7 +53,7 @@ pub async fn run_stress_test(test_type: &str, duration: Duration, lhm_dir: Optio
     // GPU stress: launch nvidia-smi powered CUDA burn via dedicated threads
     let gpu_handles = if test_type == "gpu" || test_type == "both" {
         let running_clone = running.clone();
-        Some(start_gpu_stress(running_clone))
+        Some(start_gpu_stress(running_clone, msg_starting_gpu, msg_webgpu_fallback))
     } else {
         None
     };
@@ -93,7 +101,7 @@ pub async fn run_stress_test(test_type: &str, duration: Duration, lhm_dir: Optio
 
     // Signal all threads to stop
     running.store(false, Ordering::SeqCst);
-    pb.finish_with_message("Complete!".green().to_string());
+    pb.finish_with_message(msg_complete.green().to_string());
 
     // Wait for CPU threads to finish
     if let Some(handles) = cpu_handles {
@@ -118,7 +126,7 @@ pub async fn run_stress_test(test_type: &str, duration: Duration, lhm_dir: Optio
 }
 
 /// Spawns one native thread per logical CPU core running heavy math + memory stress.
-fn start_cpu_stress(running: Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
+fn start_cpu_stress(running: Arc<AtomicBool>, msg_spawned: &str) -> Vec<std::thread::JoinHandle<()>> {
     let num_threads = num_cpus::get();
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -130,10 +138,11 @@ fn start_cpu_stress(running: Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>
         handles.push(handle);
     }
 
+    let msg = msg_spawned.replace("{}", &num_threads.to_string());
     println!(
-        "  {} Spawned {} CPU stress threads",
-        "✓".green(),
-        num_threads.to_string().yellow()
+        "  {} {}",
+        "\u{2713}".green(),
+        msg
     );
 
     handles
@@ -213,15 +222,16 @@ fn cpu_stress_worker(thread_id: usize, running: &AtomicBool) {
 /// GPU stress: runs heavy computation on the actual GPU using wgpu (WebGPU).
 /// Maps to Vulkan on Windows/Linux, Metal on macOS, DX12 as fallback.
 /// Falls back to CPU-based FP stress if no GPU is available.
-fn start_gpu_stress(running: Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
+fn start_gpu_stress(running: Arc<AtomicBool>, msg_starting: &str, msg_fallback: &str) -> Vec<std::thread::JoinHandle<()>> {
     let mut handles = Vec::new();
 
     match init_wgpu_stress() {
         Ok(gpu_context) => {
+            let msg = msg_starting.replace("{}", &gpu_context.device_name);
             println!(
-                "  {} Starting GPU stress (WebGPU compute on {})",
-                "✓".green(),
-                gpu_context.device_name.yellow()
+                "  {} {}",
+                "\u{2713}".green(),
+                msg
             );
 
             let running_clone = running.clone();
@@ -231,10 +241,11 @@ fn start_gpu_stress(running: Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>
             handles.push(handle);
         }
         Err(e) => {
+            let msg = msg_fallback.replace("{}", &e.to_string());
             println!(
-                "  {} WebGPU not available ({}), using CPU-based FP stress",
-                "⚠".yellow(),
-                e
+                "  {} {}",
+                "\u{26a0}".yellow(),
+                msg
             );
 
             let running_clone = running.clone();

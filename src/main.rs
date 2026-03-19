@@ -8,6 +8,7 @@ mod hardware;
 mod stress;
 mod temps;
 mod submit;
+mod lang;
 #[cfg(windows)]
 mod lhm;
 
@@ -56,6 +57,10 @@ struct Cli {
     /// Ambient room temperature in °C
     #[arg(long)]
     ambient_temp: Option<f64>,
+
+    /// Language override: en, fr, es, de, pt (auto-detected from OS if omitted)
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 #[tokio::main]
@@ -66,15 +71,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Detect locale and load translations
+    let locale = lang::detect_locale(cli.lang.as_deref());
+    let lang = lang::Lang::new(&locale);
+
     // Validate test type if provided via CLI arg
     if let Some(ref test) = cli.test {
         if !["cpu", "gpu", "both"].contains(&test.as_str()) {
             eprintln!(
-                "{} Invalid test type '{}'. Use: cpu, gpu, or both",
+                "{} {}",
                 "Error:".red().bold(),
-                test
+                lang.invalid_test_type.replace("{}", test)
             );
-            wait_for_exit();
+            wait_for_exit(&lang);
             std::process::exit(1);
         }
     }
@@ -83,11 +92,11 @@ async fn main() -> Result<()> {
     if let Some(ref ct) = cli.cooling_type {
         if !["air", "aio", "custom_loop", "stock", "passive", "other"].contains(&ct.as_str()) {
             eprintln!(
-                "{} Invalid cooling type '{}'. Use: stock, air, aio, custom_loop, passive, or other",
+                "{} {}",
                 "Error:".red().bold(),
-                ct
+                lang.invalid_cooling_type.replace("{}", ct)
             );
-            wait_for_exit();
+            wait_for_exit(&lang);
             std::process::exit(1);
         }
     }
@@ -95,34 +104,34 @@ async fn main() -> Result<()> {
     print_banner();
 
     // Step 1: Detect hardware
-    println!("\n{}", "▸ Detecting hardware...".cyan().bold());
+    println!("\n{}", format!("\u{25b8} {}", lang.detecting_hardware).cyan().bold());
     let hw = hardware::detect_hardware();
-    print_hardware(&hw);
+    print_hardware(&hw, &lang);
 
     // Detect device type (laptop vs desktop)
     let is_laptop = hw.is_laptop;
     if is_laptop {
         println!(
             "  {} {}",
-            "💻".normal(),
-            "Laptop detected".cyan().bold()
+            "\u{1f4bb}".normal(),
+            lang.laptop_detected.cyan().bold()
         );
     }
 
     if cli.detect_only {
-        wait_for_exit();
+        wait_for_exit(&lang);
         return Ok(());
     }
 
     // Interactive prompts if test type / duration not provided via CLI args
     let test_type = match cli.test {
         Some(t) => t,
-        None => prompt_test_type(),
+        None => prompt_test_type(&lang),
     };
 
     let duration_secs = match cli.duration {
         Some(d) => d,
-        None => prompt_duration(),
+        None => prompt_duration(&lang),
     };
 
     // Laptop: ask for laptop model, default cooling to stock
@@ -132,24 +141,24 @@ async fn main() -> Result<()> {
     let cooling_model: Option<String>;
 
     if is_laptop {
-        laptop_model = prompt_laptop_model();
+        laptop_model = prompt_laptop_model(&lang);
         cooling_type = cli.cooling_type.or(Some("stock".to_string()));
         cooling_model = cli.cooling_model;
     } else {
         laptop_model = None;
         cooling_type = match cli.cooling_type {
             Some(ct) => Some(ct),
-            None => prompt_cooling_type(),
+            None => prompt_cooling_type(&lang),
         };
         cooling_model = match cli.cooling_model {
             Some(cm) => Some(cm),
-            None => prompt_cooling_model(),
+            None => prompt_cooling_model(&lang),
         };
     }
 
     let ambient_temp = match cli.ambient_temp {
         Some(at) => Some(at),
-        None => prompt_ambient_temp(),
+        None => prompt_ambient_temp(&lang),
     };
 
     // Extract embedded LibreHardwareMonitor for accurate CPU die temps
@@ -159,31 +168,34 @@ async fn main() -> Result<()> {
     {
         if is_elevated() {
             println!(
-                "\n  {} Extracting sensor library...",
-                "▸".cyan()
+                "\n  {} {}",
+                "\u{25b8}".cyan(),
+                lang.extracting_sensor
             );
             lhm_dir = lhm::ensure_extracted();
             if lhm_dir.is_some() {
                 println!(
-                    "  {} Sensor library ready (accurate CPU die temps enabled)",
-                    "✓".green()
+                    "  {} {}",
+                    "\u{2713}".green(),
+                    lang.sensor_ready
                 );
             }
         } else {
             lhm_dir = None;
             println!(
-                "\n  {} This tool requires {} for accurate CPU temperatures.",
-                "⚠".yellow().bold(),
-                "Run as Administrator".cyan().bold()
+                "\n  {} {}",
+                "\u{26a0}".yellow().bold(),
+                lang.requires_admin_msg
             );
             println!(
-                "  {} Right-click your terminal → {}",
-                "→".dimmed(),
-                "Run as administrator".cyan()
+                "  {} {}",
+                "\u{2192}".dimmed(),
+                lang.right_click_msg
             );
             println!(
-                "  {} Continuing with board-level sensors (less accurate)...\n",
-                "→".dimmed()
+                "  {} {}\n",
+                "\u{2192}".dimmed(),
+                lang.continuing_board
             );
         }
     }
@@ -194,31 +206,41 @@ async fn main() -> Result<()> {
     }
 
     // Step 2: Read idle temperatures
-    println!("{}", "▸ Reading idle temperatures...".cyan().bold());
+    println!("{}", format!("\u{25b8} {} {}", "Reading", lang.idle).cyan().bold());
     let idle_temps = temps::read_temperatures_with_lhm(lhm_dir.as_ref());
-    print_temps(&idle_temps, "Idle");
+    print_temps(&idle_temps, &lang.idle, &lang);
 
     // Step 3: Run stress test
     let duration = Duration::from_secs(duration_secs);
+    let stress_msg = lang.running_stress
+        .replacen("{}", &test_type.to_uppercase(), 1)
+        .replacen("{}", &duration_secs.to_string(), 1);
     println!(
-        "\n{} Running {} stress test for {}s...",
-        "▸".cyan().bold(),
-        test_type.to_uppercase().yellow().bold(),
-        duration_secs
+        "\n{} {}",
+        "\u{25b8}".cyan().bold(),
+        stress_msg.yellow().bold()
     );
     println!(
         "  {}",
-        "Press Ctrl+C to stop early.".dimmed()
+        lang.press_ctrl_c.dimmed()
     );
 
-    let stress_result = stress::run_stress_test(&test_type, duration, lhm_dir.as_ref()).await;
+    let stress_result = stress::run_stress_test(
+        &test_type,
+        duration,
+        lhm_dir.as_ref(),
+        lang.spawned_cpu_threads,
+        lang.starting_gpu_stress,
+        lang.webgpu_fallback,
+        lang.complete,
+    ).await;
 
     // Step 4: Read load temperatures (right after stress completes)
-    println!("\n{}", "▸ Reading load temperatures...".cyan().bold());
+    println!("\n{}", format!("\u{25b8} {} {}", "Reading", lang.load).cyan().bold());
     // Small delay to let final temp readings stabilize — temps lag behind actual load
     tokio::time::sleep(Duration::from_millis(500)).await;
     let load_temps = temps::read_temperatures_with_lhm(lhm_dir.as_ref());
-    print_temps(&load_temps, "Load");
+    print_temps(&load_temps, &lang.load, &lang);
 
     // Use peak temps captured during stress if higher than post-stress reading
     let final_load_temps = temps::TemperatureReading {
@@ -233,71 +255,71 @@ async fn main() -> Result<()> {
     };
 
     // Step 5: Display results
-    println!("\n{}", "━".repeat(50).dimmed());
-    println!("{}", "  RESULTS SUMMARY".green().bold());
-    println!("{}", "━".repeat(50).dimmed());
+    println!("\n{}", "\u{2501}".repeat(50).dimmed());
+    println!("  {}", lang.results_summary.green().bold());
+    println!("{}", "\u{2501}".repeat(50).dimmed());
 
     if let Some(idle_cpu) = idle_temps.cpu_temp {
-        println!("  CPU Idle:  {:.1}°C", idle_cpu);
+        println!("  {} {:.1}\u{00b0}C", lang.cpu_idle_label, idle_cpu);
     }
     if let Some(load_cpu) = final_load_temps.cpu_temp {
-        println!("  CPU Load:  {:.1}°C", load_cpu);
+        println!("  {} {:.1}\u{00b0}C", lang.cpu_load_label, load_cpu);
     }
     if let Some(idle_gpu) = idle_temps.gpu_temp {
-        println!("  GPU Idle:  {:.1}°C", idle_gpu);
+        println!("  {} {:.1}\u{00b0}C", lang.gpu_idle_label, idle_gpu);
     }
     if let Some(load_gpu) = final_load_temps.gpu_temp {
-        println!("  GPU Load:  {:.1}°C", load_gpu);
+        println!("  {} {:.1}\u{00b0}C", lang.gpu_load_label, load_gpu);
     }
     if let Some(cpu_usage) = stress_result.cpu_usage_max {
-        println!("  CPU Max Usage: {:.0}%", cpu_usage);
+        println!("  {} {:.0}%", lang.cpu_max_usage, cpu_usage);
     }
     if let Some(gpu_usage) = stress_result.gpu_usage_max {
-        println!("  GPU Max Usage: {:.0}%", gpu_usage);
+        println!("  {} {:.0}%", lang.gpu_max_usage, gpu_usage);
     }
     if let Some(ref ct) = cooling_type {
         let label = match ct.as_str() {
-            "stock" => "Stock Cooler",
-            "air" => "Aftermarket Air",
-            "aio" => "AIO Liquid",
-            "custom_loop" => "Custom Loop",
-            "passive" => "Passive / Fanless",
-            "other" => "Other",
+            "stock" => lang.label_stock,
+            "air" => lang.label_air,
+            "aio" => lang.label_aio,
+            "custom_loop" => lang.label_custom_loop,
+            "passive" => lang.label_passive,
+            "other" => lang.label_other,
             _ => ct.as_str(),
         };
-        println!("  Cooling: {}", label);
+        println!("  {} {}", lang.cooling_label, label);
     }
     if let Some(ref lm) = laptop_model {
-        println!("  Laptop:  {}", lm);
+        println!("  {} {}", lang.laptop_label, lm);
     }
     if let Some(ref cm) = cooling_model {
-        println!("  Cooler:  {}", cm);
+        println!("  {} {}", lang.cooler_label, cm);
     }
     if let Some(at) = ambient_temp {
-        println!("  Ambient: {:.1}°C", at);
+        println!("  {} {:.1}\u{00b0}C", lang.ambient_label, at);
     }
-    println!("{}", "━".repeat(50).dimmed());
+    println!("{}", "\u{2501}".repeat(50).dimmed());
 
     // Detect stale CPU temp (board sensor didn't change during stress)
     #[cfg(windows)]
     if let (Some(idle_cpu), Some(load_cpu)) = (idle_temps.cpu_temp, final_load_temps.cpu_temp) {
         if (load_cpu - idle_cpu).abs() < 3.0 && stress_result.cpu_usage_max.unwrap_or(0.0) > 80.0 {
             println!(
-                "\n  {} CPU temp didn't change — reading is from a {} sensor.",
-                "ℹ".cyan(),
-                "board-level".yellow()
+                "\n  {} {}",
+                "\u{2139}".cyan(),
+                lang.board_sensor_warning
             );
             println!(
-                "  {} Re-run as {} for accurate CPU die temps.",
-                "→".dimmed(),
-                "Administrator".cyan().bold()
+                "  {} {}",
+                "\u{2192}".dimmed(),
+                lang.rerun_admin
             );
         }
     }
 
     // Step 6: Submit results
     if !cli.no_submit {
-        println!("\n{}", "▸ Submitting results...".cyan().bold());
+        println!("\n{}", format!("\u{25b8} {}", lang.submitting).cyan().bold());
         let payload = submit::SubmissionPayload {
             test_type: test_type.clone(),
             stress_method: "cli_tool".to_string(),
@@ -331,57 +353,62 @@ async fn main() -> Result<()> {
                 };
                 let results_url = format!("{}/results/{}", base_url, id);
                 println!(
-                    "  {} Submitted! View at: {}",
-                    "✓".green().bold(),
+                    "  {} {} {}",
+                    "\u{2713}".green().bold(),
+                    lang.submitted_view,
                     results_url.cyan()
                 );
-                open_browser(&results_url);
+                open_browser(&results_url, &lang);
             }
             Err(e) => {
                 // If production URL failed, try localhost automatically
                 if cli.api_url == DEFAULT_API_URL {
                     println!(
-                        "  {} Production API unreachable, trying localhost...",
-                        "⚠".yellow()
+                        "  {} {}",
+                        "\u{26a0}".yellow(),
+                        lang.prod_unreachable
                     );
                     match submit::submit_results(LOCAL_API_URL, &payload).await {
                         Ok(id) => {
                             let results_url = format!("{}/results/{}", LOCAL_SITE_URL, id);
                             println!(
-                                "  {} Submitted to local server! View at: {}",
-                                "✓".green().bold(),
+                                "  {} {} {}",
+                                "\u{2713}".green().bold(),
+                                lang.submitted_local,
                                 results_url.cyan()
                             );
-                            open_browser(&results_url);
+                            open_browser(&results_url, &lang);
                         }
                         Err(e2) => {
                             eprintln!(
-                                "  {} Failed to submit: {}",
-                                "✗".red().bold(),
+                                "  {} {} {}",
+                                "\u{2717}".red().bold(),
+                                lang.failed_submit,
                                 e2
                             );
-                            eprintln!("  {}", "Results were displayed above but not saved online.".dimmed());
+                            eprintln!("  {}", lang.not_saved_online.dimmed());
                         }
                     }
                 } else {
                     eprintln!(
-                        "  {} Failed to submit: {}",
-                        "✗".red().bold(),
+                        "  {} {} {}",
+                        "\u{2717}".red().bold(),
+                        lang.failed_submit,
                         e
                     );
-                    eprintln!("  {}", "Results were displayed above but not saved online.".dimmed());
+                    eprintln!("  {}", lang.not_saved_online.dimmed());
                 }
             }
         }
     } else {
         println!(
             "\n  {}",
-            "Skipping submission (--no-submit flag).".dimmed()
+            lang.skipping_submit.dimmed()
         );
     }
 
-    println!("\n{}", "Done!".green().bold());
-    wait_for_exit();
+    println!("\n{}", lang.done.green().bold());
+    wait_for_exit(&lang);
     Ok(())
 }
 
@@ -419,12 +446,12 @@ fn enable_ansi_colors() {
 }
 
 /// Prompt user to choose test type interactively
-fn prompt_test_type() -> String {
-    println!("\n{}", "▸ What would you like to test?".cyan().bold());
-    println!("  {} CPU only", "[1]".yellow());
-    println!("  {} GPU only", "[2]".yellow());
-    println!("  {} CPU + GPU (recommended)", "[3]".yellow());
-    print!("\n  Enter choice (1/2/3) [{}]: ", "3".yellow());
+fn prompt_test_type(lang: &lang::Lang) -> String {
+    println!("\n{}", format!("\u{25b8} {}", lang.what_to_test).cyan().bold());
+    println!("  {} {}", "[1]".yellow(), lang.cpu_only);
+    println!("  {} {}", "[2]".yellow(), lang.gpu_only);
+    println!("  {} {}", "[3]".yellow(), lang.cpu_gpu_recommended);
+    print!("\n  {} [{}]: ", lang.enter_choice_test, "3".yellow());
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -437,24 +464,25 @@ fn prompt_test_type() -> String {
 }
 
 /// Prompt user for test duration interactively
-fn prompt_duration() -> u64 {
-    println!("\n{}", "▸ How long should the stress test run?".cyan().bold());
+fn prompt_duration(lang: &lang::Lang) -> u64 {
+    println!("\n{}", format!("\u{25b8} {}", lang.how_long_stress).cyan().bold());
     println!(
-        "  {} We recommend at least {} so cooling systems have time to",
-        "ℹ".cyan(),
-        "120 seconds".yellow()
+        "  {} {}",
+        "\u{2139}".cyan(),
+        lang.recommend_note
     );
     println!(
-        "  {} fully engage and give realistic sustained temperatures.",
-        " ".normal()
+        "  {} {}",
+        " ".normal(),
+        lang.recommend_reason
     );
     println!();
-    println!("  {}  60 seconds  (quick)", "[1]".yellow());
-    println!("  {} 120 seconds  (recommended)", "[2]".yellow());
-    println!("  {} 180 seconds  (thorough)", "[3]".yellow());
-    println!("  {} 300 seconds  (extended)", "[4]".yellow());
-    println!("  {} Custom", "[5]".yellow());
-    print!("\n  Enter choice (1-5) [{}]: ", "2".yellow());
+    println!("  {} {}", "[1]".yellow(), lang.dur_60);
+    println!("  {} {}", "[2]".yellow(), lang.dur_120);
+    println!("  {} {}", "[3]".yellow(), lang.dur_180);
+    println!("  {} {}", "[4]".yellow(), lang.dur_300);
+    println!("  {} {}", "[5]".yellow(), lang.dur_custom);
+    print!("\n  {} [{}]: ", lang.enter_choice_duration, "2".yellow());
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -464,15 +492,16 @@ fn prompt_duration() -> u64 {
         "3" => 180,
         "4" => 300,
         "5" => {
-            print!("  Enter duration in seconds: ");
+            print!("  {} ", lang.enter_duration_secs);
             io::stdout().flush().ok();
             let mut custom = String::new();
             io::stdin().read_line(&mut custom).ok();
             let secs = custom.trim().parse::<u64>().unwrap_or(120);
             if secs < 30 {
                 println!(
-                    "  {} Minimum duration is 30 seconds, using 30s.",
-                    "⚠".yellow()
+                    "  {} {}",
+                    "\u{26a0}".yellow(),
+                    lang.min_duration_30
                 );
                 30
             } else {
@@ -484,13 +513,13 @@ fn prompt_duration() -> u64 {
 }
 
 /// Prompt user for laptop model name (free text, optional)
-fn prompt_laptop_model() -> Option<String> {
-    println!("\n{}", "\u{25b8} What laptop model do you have? (optional)".cyan().bold());
+fn prompt_laptop_model(lang: &lang::Lang) -> Option<String> {
+    println!("\n{}", format!("\u{25b8} {}", lang.laptop_model_prompt).cyan().bold());
     println!(
         "  {}",
-        "e.g. ASUS ROG Zephyrus G14, Dell XPS 15, Lenovo Legion 5 Pro".dimmed()
+        lang.laptop_model_examples.dimmed()
     );
-    print!("  Laptop model (Enter to skip): ");
+    print!("  {} ", lang.laptop_model_input);
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -504,16 +533,16 @@ fn prompt_laptop_model() -> Option<String> {
 }
 
 /// Prompt user to choose cooling system type
-fn prompt_cooling_type() -> Option<String> {
-    println!("\n{}", "\u{25b8} What type of CPU cooling do you use?".cyan().bold());
-    println!("  {} Stock Cooler", "[1]".yellow());
-    println!("  {} Aftermarket Air Cooler", "[2]".yellow());
-    println!("  {} AIO Liquid Cooler", "[3]".yellow());
-    println!("  {} Custom Water Loop", "[4]".yellow());
-    println!("  {} Passive / Fanless", "[5]".yellow());
-    println!("  {} Other", "[6]".yellow());
-    println!("  {} Skip", "[Enter]".dimmed());
-    print!("\n  Enter choice (1-6) or Enter to skip: ");
+fn prompt_cooling_type(lang: &lang::Lang) -> Option<String> {
+    println!("\n{}", format!("\u{25b8} {}", lang.cooling_type_prompt).cyan().bold());
+    println!("  {} {}", "[1]".yellow(), lang.cooling_stock);
+    println!("  {} {}", "[2]".yellow(), lang.cooling_air);
+    println!("  {} {}", "[3]".yellow(), lang.cooling_aio);
+    println!("  {} {}", "[4]".yellow(), lang.cooling_custom_loop);
+    println!("  {} {}", "[5]".yellow(), lang.cooling_passive);
+    println!("  {} {}", "[6]".yellow(), lang.cooling_other);
+    println!("  {} {}", "[Enter]".dimmed(), lang.skip);
+    print!("\n  {} ", lang.enter_choice_cooling);
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -530,13 +559,13 @@ fn prompt_cooling_type() -> Option<String> {
 }
 
 /// Prompt user for cooler model name (free text, optional)
-fn prompt_cooling_model() -> Option<String> {
-    println!("\n{}", "\u{25b8} What cooler model do you have? (optional)".cyan().bold());
+fn prompt_cooling_model(lang: &lang::Lang) -> Option<String> {
+    println!("\n{}", format!("\u{25b8} {}", lang.cooling_model_prompt).cyan().bold());
     println!(
         "  {}",
-        "e.g. Noctua NH-D15, Corsair H150i, be quiet! Dark Rock Pro 4".dimmed()
+        lang.cooling_model_examples.dimmed()
     );
-    print!("  Cooler model (Enter to skip): ");
+    print!("  {} ", lang.cooling_model_input);
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -550,13 +579,13 @@ fn prompt_cooling_model() -> Option<String> {
 }
 
 /// Prompt user for ambient room temperature (optional, accepts C or F)
-fn prompt_ambient_temp() -> Option<f64> {
-    println!("\n{}", "\u{25b8} What\u{2019}s your ambient room temperature? (optional)".cyan().bold());
+fn prompt_ambient_temp(lang: &lang::Lang) -> Option<f64> {
+    println!("\n{}", format!("\u{25b8} {}", lang.ambient_temp_prompt).cyan().bold());
     println!(
         "  {}",
-        "Enter a number in \u{00b0}C or add 'f' for Fahrenheit (e.g. 22, 72f)".dimmed()
+        lang.ambient_temp_hint.dimmed()
     );
-    print!("  Room temp (Enter to skip): ");
+    print!("  {} ", lang.room_temp_input);
     io::stdout().flush().ok();
 
     let mut input = String::new();
@@ -579,7 +608,7 @@ fn prompt_ambient_temp() -> Option<f64> {
             );
             Some(rounded)
         } else {
-            println!("  {} Couldn't parse temperature, skipping.", "\u{26a0}".yellow());
+            println!("  {} {}", "\u{26a0}".yellow(), lang.cant_parse_temp);
             None
         }
     } else {
@@ -587,31 +616,33 @@ fn prompt_ambient_temp() -> Option<f64> {
         if let Ok(c) = trimmed.parse::<f64>() {
             Some((c * 10.0).round() / 10.0)
         } else {
-            println!("  {} Couldn't parse temperature, skipping.", "\u{26a0}".yellow());
+            println!("  {} {}", "\u{26a0}".yellow(), lang.cant_parse_temp);
             None
         }
     }
 }
 
 /// Auto-close after 30 seconds with countdown, or exit early with Ctrl-C
-fn wait_for_exit() {
+fn wait_for_exit(lang: &lang::Lang) {
     println!(
         "\n  {}",
-        "Window will close in 30 seconds. Press Ctrl+C to exit now.".dimmed()
+        lang.window_closing.dimmed()
     );
     for remaining in (1..=30).rev() {
-        print!("\r  Closing in {}s...  ", remaining);
+        let msg = lang.closing_in.replace("{}", &remaining.to_string());
+        print!("\r  {}  ", msg);
         io::stdout().flush().ok();
         std::thread::sleep(Duration::from_secs(1));
     }
-    println!("\r  {}", "Goodbye!".green());
+    println!("\r  {}", lang.goodbye.green());
 }
 
 /// Open the results URL in the user's default browser
-fn open_browser(url: &str) {
+fn open_browser(url: &str, lang: &lang::Lang) {
     println!(
-        "  {} Opening results in your browser...",
-        "→".dimmed()
+        "  {} {}",
+        "\u{2192}".dimmed(),
+        lang.opening_browser
     );
 
     #[cfg(windows)]
@@ -655,17 +686,17 @@ fn print_banner() {
     );
 }
 
-fn print_hardware(hw: &hardware::HardwareInfo) {
-    println!("  CPU:  {}", hw.cpu_model.as_deref().unwrap_or("Unknown").yellow());
-    println!("  Cores: {}", hw.cpu_cores.map(|c| c.to_string()).unwrap_or("Unknown".to_string()));
-    println!("  GPU:  {}", hw.gpu_model.as_deref().unwrap_or("Unknown").yellow());
+fn print_hardware(hw: &hardware::HardwareInfo, lang: &lang::Lang) {
+    println!("  CPU:  {}", hw.cpu_model.as_deref().unwrap_or(lang.unknown).yellow());
+    println!("  Cores: {}", hw.cpu_cores.map(|c| c.to_string()).unwrap_or(lang.unknown.to_string()));
+    println!("  GPU:  {}", hw.gpu_model.as_deref().unwrap_or(lang.unknown).yellow());
     if let Some(ref vram) = hw.gpu_vram {
         println!("  VRAM: {}", vram);
     }
-    println!("  OS:   {}", hw.os.as_deref().unwrap_or("Unknown"));
+    println!("  OS:   {}", hw.os.as_deref().unwrap_or(lang.unknown));
 }
 
-fn print_temps(temps: &temps::TemperatureReading, label: &str) {
+fn print_temps(temps: &temps::TemperatureReading, label: &str, lang: &lang::Lang) {
     if let Some(cpu) = temps.cpu_temp {
         let color = if cpu > 85.0 {
             "red"
@@ -682,7 +713,7 @@ fn print_temps(temps: &temps::TemperatureReading, label: &str) {
         };
         println!("  CPU {}: {}", label, colored);
     } else {
-        println!("  CPU {}: {}", label, "Not available".dimmed());
+        println!("  CPU {}: {}", label, lang.not_available.dimmed());
     }
     if let Some(gpu) = temps.gpu_temp {
         let color = if gpu > 85.0 {
@@ -700,6 +731,6 @@ fn print_temps(temps: &temps::TemperatureReading, label: &str) {
         };
         println!("  GPU {}: {}", label, colored);
     } else {
-        println!("  GPU {}: {}", label, "Not available".dimmed());
+        println!("  GPU {}: {}", label, lang.not_available.dimmed());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "thermalstats"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "ThermalStats CLI — stress test your CPU/GPU and submit real temperatures"
 license = "MIT"
@@ -38,6 +38,9 @@ rand = "0.8"
 
 # Number of CPUs (logical cores)
 num_cpus = "1"
+
+# OS locale detection
+sys-locale = "0.3"
 
 # WebGPU for cross-platform GPU compute stress (Vulkan/Metal/DX12)
 wgpu = { version = "25", default-features = false, features = ["wgsl", "vulkan", "metal"] }

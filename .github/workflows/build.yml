@@ -66,12 +66,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install OpenCL (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ocl-icd-opencl-dev
-
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
