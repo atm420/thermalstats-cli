@@ -85,6 +85,7 @@ jobs:
   sign-windows:
     needs: build
     runs-on: windows-latest
+    environment: signing
 
     steps:
       - name: Download Windows artifact
