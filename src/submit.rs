@@ -25,6 +25,7 @@ pub struct SubmissionPayload {
     pub gpu_usage_max: Option<f64>,
     pub test_duration: Option<i64>,
     pub cli_version: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

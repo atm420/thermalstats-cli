@@ -48,7 +48,8 @@ pub fn ensure_extracted() -> Option<PathBuf> {
 }
 
 /// Install or start the PawnIO kernel driver silently.
-/// Uses pnputil for silent driver installation (no UI prompts).
+/// PawnIO is a WHQL-signed kernel driver required by LibreHardwareMonitor
+/// for CPU MSR access (reading die temperatures on AMD and Intel).
 fn ensure_pawnio_driver(dir: &PathBuf) {
     // Check if PawnIO service is already running
     let check = std::process::Command::new("sc.exe")
@@ -64,39 +65,55 @@ fn ensure_pawnio_driver(dir: &PathBuf) {
         }
         // Service exists but not running — try to start it
         if output.status.success() {
-            let start = std::process::Command::new("sc.exe")
+            let _ = std::process::Command::new("sc.exe")
                 .args(["start", "PawnIO"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .output();
-            if let Ok(o) = start {
-                if o.status.success() {
-                    return;
-                }
-            }
+            return;
         }
     }
 
-    // Service doesn't exist — install driver using pnputil (silent, no UI)
-    let inf_path = dir.join("pawnio").join("pawnio.inf");
-    if !inf_path.exists() {
+    // Service doesn't exist — install the driver silently
+    let pawnio_dir = dir.join("pawnio");
+    let inf_path = pawnio_dir.join("pawnio.inf");
+    let sys_path = pawnio_dir.join("PawnIO.sys");
+    if !inf_path.exists() || !sys_path.exists() {
         return;
     }
 
-    let install = std::process::Command::new("pnputil.exe")
-        .args(["/add-driver", &inf_path.to_string_lossy(), "/install"])
+    // Step 1: Add driver package to store (installs the WHQL catalog for signature verification)
+    let _ = std::process::Command::new("pnputil.exe")
+        .args(["/add-driver", &inf_path.to_string_lossy()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output();
 
-    if install.is_ok() {
-        // Start the service after installation
-        let _ = std::process::Command::new("sc.exe")
-            .args(["start", "PawnIO"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-    }
+    // Step 2: Copy .sys to System32\drivers (stable kernel-accessible path)
+    let sys_dest = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()))
+        .join("System32")
+        .join("drivers")
+        .join("PawnIO.sys");
+    let _ = std::fs::copy(&sys_path, &sys_dest);
+
+    // Step 3: Create the kernel service
+    let _ = std::process::Command::new("sc.exe")
+        .args([
+            "create", "PawnIO",
+            "type=", "kernel",
+            "start=", "demand",
+            "binPath=", "System32\\drivers\\PawnIO.sys",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    // Step 4: Start the service
+    let _ = std::process::Command::new("sc.exe")
+        .args(["start", "PawnIO"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
 }
 
 fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {

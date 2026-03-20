@@ -342,6 +342,7 @@ async fn main() -> Result<()> {
             gpu_usage_max: stress_result.gpu_usage_max,
             test_duration: Some(duration_secs as i64),
             cli_version: Some(VERSION.to_string()),
+            session_id: Some(generate_machine_id(&hw)),
         };
 
         match submit::submit_results(&cli.api_url, &payload).await {
@@ -694,6 +695,22 @@ fn print_hardware(hw: &hardware::HardwareInfo, lang: &lang::Lang) {
         println!("  VRAM: {}", vram);
     }
     println!("  OS:   {}", hw.os.as_deref().unwrap_or(lang.unknown));
+}
+
+/// Generate a deterministic machine ID from hostname + CPU model.
+/// Same machine always produces the same ID = 1 contributor per machine.
+fn generate_machine_id(hw: &hardware::HardwareInfo) -> String {
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let cpu = hw.cpu_model.as_deref().unwrap_or("");
+    // Simple hash: djb2
+    let input = format!("{}:{}", hostname, cpu);
+    let mut hash: u64 = 5381;
+    for b in input.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    format!("cli-{:016x}", hash)
 }
 
 fn print_temps(temps: &temps::TemperatureReading, label: &str, lang: &lang::Lang) {
