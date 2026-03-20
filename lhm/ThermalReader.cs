@@ -62,6 +62,12 @@ class ThermalReader
 
             computer.Close();
 
+            // Diagnostic: if CPU detected but no temp, list what sensors were found
+            if (cpuName != null && !cpuTemp.HasValue)
+            {
+                Console.Error.Write("DIAG:CPU_detected=" + cpuName + ",no_temp_sensors");
+            }
+
             // Output JSON
             string cpuVal = cpuTemp.HasValue ? cpuTemp.Value.ToString("F1", CultureInfo.InvariantCulture) : "null";
             string gpuVal = gpuTemp.HasValue ? gpuTemp.Value.ToString("F1", CultureInfo.InvariantCulture) : "null";
