@@ -63,6 +63,7 @@ thermalstats --detect-only
 ### Windows
 - **Right-click → Run as administrator** for the most accurate CPU die temperatures
 - Embeds [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — no manual setup needed
+- Installs [PawnIO](https://pawnio.eu) driver on first run (required by LibreHardwareMonitor for CPU MSR access). PawnIO will appear in "Add and remove programs" and can be uninstalled independently
 - Falls back to WMI `MSAcpi_ThermalZoneTemperature` if LHM is unavailable
 - GPU temps via `nvidia-smi` (NVIDIA) or WMI fallback
 
@@ -102,6 +103,11 @@ The binary will be at `target/release/thermalstats` (or `thermalstats.exe` on Wi
 - Run for at least **120 seconds** so your cooling system has time to fully engage under sustained load
 - Close other heavy applications before testing for the most accurate results
 - NVIDIA users: ensure drivers are installed so `nvidia-smi` is available
+
+## Third-Party Software
+
+- **[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)** (MPL-2.0) — Hardware monitoring library used for accurate sensor readings on Windows
+- **[PawnIO](https://pawnio.eu)** — WHQL-signed kernel driver required by LibreHardwareMonitor for CPU MSR access. The official installer is bundled and redistributed with permission from the developer ([namazso](https://github.com/namazso)). PawnIO is installed on first run and can be uninstalled via "Add and remove programs"
 
 ## License
 

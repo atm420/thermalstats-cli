@@ -1,6 +1,10 @@
 /// Embedded LibreHardwareMonitor integration (Windows only).
 /// Extracts a bundled ThermalReader helper + LHM library to %APPDATA%\ThermalStats\lhm\
 /// and uses it to read accurate CPU die temperatures via kernel-mode MSR access.
+///
+/// PawnIO (https://pawnio.eu) is a WHQL-signed kernel driver required by
+/// LibreHardwareMonitor for CPU MSR access. The official PawnIO installer is
+/// bundled and redistributed with permission from the developer.
 
 use std::path::PathBuf;
 use colored::Colorize;
@@ -10,6 +14,19 @@ const LHM_VERSION: &str = "0.9.6.1";
 // The LHM bundle zip is embedded at compile time
 const LHM_BUNDLE: &[u8] = include_bytes!("../lhm/lhm-bundle.zip");
 
+/// Result of PawnIO driver setup
+#[derive(Debug, PartialEq)]
+pub enum PawnIOStatus {
+    /// PawnIO was already installed and running
+    AlreadyInstalled,
+    /// PawnIO was just installed by the official installer
+    Installed,
+    /// PawnIO installation failed
+    Failed(String),
+    /// PawnIO installer was not found in the bundle
+    InstallerMissing,
+}
+
 /// Get the extraction directory: %APPDATA%\ThermalStats\lhm\
 fn lhm_dir() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
@@ -17,103 +34,101 @@ fn lhm_dir() -> Option<PathBuf> {
 }
 
 /// Ensure LHM files are extracted and PawnIO driver is available.
-/// Returns the directory path if successful.
-pub fn ensure_extracted() -> Option<PathBuf> {
-    let dir = lhm_dir()?;
+/// Returns (directory path, PawnIO status) — directory is None if extraction failed.
+pub fn ensure_extracted() -> (Option<PathBuf>, PawnIOStatus) {
+    let dir = match lhm_dir() {
+        Some(d) => d,
+        None => return (None, PawnIOStatus::Failed("Could not determine app data directory".into())),
+    };
     let version_file = dir.join(".version");
 
     // Check if already extracted with correct version
-    if version_file.exists() {
-        if let Ok(v) = std::fs::read_to_string(&version_file) {
-            if v.trim() == LHM_VERSION {
-                ensure_pawnio_driver(&dir);
-                return Some(dir);
-            }
+    let needs_extract = if version_file.exists() {
+        match std::fs::read_to_string(&version_file) {
+            Ok(v) if v.trim() == LHM_VERSION => false,
+            _ => true,
+        }
+    } else {
+        true
+    };
+
+    if needs_extract {
+        if let Err(e) = extract_bundle(&dir) {
+            eprintln!("  Failed to extract sensor library: {}", e);
+            return (None, PawnIOStatus::Failed(e.to_string()));
+        }
+        let _ = std::fs::write(&version_file, LHM_VERSION);
+    }
+
+    // Ensure PawnIO driver is available via the official installer
+    let pawnio_status = ensure_pawnio(&dir);
+
+    (Some(dir), pawnio_status)
+}
+
+/// Check if PawnIO is already installed by looking for it in the registry
+/// (the official installer writes to Add/Remove Programs).
+fn is_pawnio_installed() -> bool {
+    let check = std::process::Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO",
+            "/v", "InstallLocation",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    if let Ok(output) = check {
+        if output.status.success() {
+            return true;
         }
     }
 
-    // Extract the bundle
-    if let Err(e) = extract_bundle(&dir) {
-        eprintln!("  Failed to extract sensor library: {}", e);
-        return None;
-    }
-
-    // Install PawnIO kernel driver silently (required for CPU MSR access)
-    ensure_pawnio_driver(&dir);
-
-    // Write version marker
-    let _ = std::fs::write(&version_file, LHM_VERSION);
-
-    Some(dir)
-}
-
-/// Install or start the PawnIO kernel driver silently.
-/// PawnIO is a WHQL-signed kernel driver required by LibreHardwareMonitor
-/// for CPU MSR access (reading die temperatures on AMD and Intel).
-fn ensure_pawnio_driver(dir: &PathBuf) {
-    // Check if PawnIO service is already running
+    // Fallback: check if the PawnIO service exists
     let check = std::process::Command::new("sc.exe")
         .args(["query", "PawnIO"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output();
 
-    if let Ok(output) = &check {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("RUNNING") {
-            return; // Driver already active
-        }
-        // Service exists but not running — try to start it
-        if output.status.success() {
-            let _ = std::process::Command::new("sc.exe")
-                .args(["start", "PawnIO"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output();
-            return;
-        }
+    matches!(check, Ok(output) if output.status.success())
+}
+
+/// Ensure PawnIO is installed using the official redistributable installer.
+/// The installer is bundled with permission from the PawnIO developer and
+/// supports silent installation via the -silent flag.
+fn ensure_pawnio(dir: &PathBuf) -> PawnIOStatus {
+    // Check if PawnIO is already installed
+    if is_pawnio_installed() {
+        return PawnIOStatus::AlreadyInstalled;
     }
 
-    // Service doesn't exist — install the driver silently
-    let pawnio_dir = dir.join("pawnio");
-    let inf_path = pawnio_dir.join("pawnio.inf");
-    let sys_path = pawnio_dir.join("PawnIO.sys");
-    if !inf_path.exists() || !sys_path.exists() {
-        return;
+    // Look for the bundled official installer
+    let installer = dir.join("PawnIO_setup.exe");
+    if !installer.exists() {
+        return PawnIOStatus::InstallerMissing;
     }
 
-    // Step 1: Add driver package to store (installs the WHQL catalog for signature verification)
-    let _ = std::process::Command::new("pnputil.exe")
-        .args(["/add-driver", &inf_path.to_string_lossy()])
+    // Run the official PawnIO installer in silent mode
+    let result = std::process::Command::new(&installer)
+        .arg("-silent")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output();
+        .status();
 
-    // Step 2: Copy .sys to System32\drivers (stable kernel-accessible path)
-    let sys_dest = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()))
-        .join("System32")
-        .join("drivers")
-        .join("PawnIO.sys");
-    let _ = std::fs::copy(&sys_path, &sys_dest);
-
-    // Step 3: Create the kernel service
-    let _ = std::process::Command::new("sc.exe")
-        .args([
-            "create", "PawnIO",
-            "type=", "kernel",
-            "start=", "demand",
-            "binPath=", "System32\\drivers\\PawnIO.sys",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-
-    // Step 4: Start the service
-    let _ = std::process::Command::new("sc.exe")
-        .args(["start", "PawnIO"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
+    match result {
+        Ok(status) => {
+            let code = status.code().unwrap_or(-1);
+            // 0 = success, 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) = success but reboot needed
+            if code == 0 || code == 3010 {
+                PawnIOStatus::Installed
+            } else {
+                PawnIOStatus::Failed(format!("PawnIO installer exited with code {}", code))
+            }
+        }
+        Err(e) => PawnIOStatus::Failed(format!("Failed to run PawnIO installer: {}", e)),
+    }
 }
 
 fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -133,13 +148,13 @@ fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
             continue;
         }
-        let allowed_ext = [".exe", ".dll", ".config", ".sys", ".inf", ".cat"];
+        let allowed_ext = [".exe", ".dll", ".config"];
         if !allowed_ext.iter().any(|ext| name.to_lowercase().ends_with(ext)) {
             continue;
         }
 
         let outpath = dir.join(&name);
-        // Create parent directories for nested files (e.g. pawnio/PawnIO.sys)
+        // Create parent directories for nested files
         if let Some(parent) = outpath.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -172,8 +172,35 @@ async fn main() -> Result<()> {
                 "\u{25b8}".cyan(),
                 lang.extracting_sensor
             );
-            lhm_dir = lhm::ensure_extracted();
+            let (dir, pawnio_status) = lhm::ensure_extracted();
+            lhm_dir = dir;
             if lhm_dir.is_some() {
+                // Show PawnIO installation status
+                match pawnio_status {
+                    lhm::PawnIOStatus::Installed => {
+                        println!(
+                            "  {} {}",
+                            "\u{2713}".green(),
+                            lang.pawnio_installed
+                        );
+                    }
+                    lhm::PawnIOStatus::AlreadyInstalled => {}
+                    lhm::PawnIOStatus::Failed(ref e) => {
+                        eprintln!(
+                            "  {} {} {}",
+                            "\u{26a0}".yellow(),
+                            lang.pawnio_failed,
+                            e
+                        );
+                    }
+                    lhm::PawnIOStatus::InstallerMissing => {
+                        eprintln!(
+                            "  {} {}",
+                            "\u{26a0}".yellow(),
+                            lang.pawnio_failed
+                        );
+                    }
+                }
                 println!(
                     "  {} {}",
                     "\u{2713}".green(),
