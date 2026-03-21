@@ -20,6 +20,8 @@ Pre-built binaries for every release are available on the [Releases page](https:
 - **Real Temperatures** — Reads actual CPU/GPU die temperatures via system APIs
 - **Native Stress Tests** — Multi-threaded CPU stress (1 thread/core, heavy math + cache thrashing); WebGPU compute stress for GPU (Vulkan/Metal/DX12)
 - **Embedded LibreHardwareMonitor** — On Windows, bundles LHM for accurate CPU die temps (no manual install needed)
+- **PawnIO Driver Integration** — Automatically installs the free, open-source [PawnIO](https://github.com/namazso/PawnIO) WHQL-signed kernel driver (required by LHM for CPU MSR access). Installed silently on first run; users are prompted to keep or uninstall after the test
+- **Auto-Elevation on Windows** — Embeds a Windows application manifest that automatically triggers a UAC prompt, so users don't need to manually right-click "Run as administrator"
 - **API Submission** — Automatically submits verified results to ThermalStats for community comparison
 - **Interactive Prompts** — Just run it — guided prompts walk you through everything
 - **Multi-Language** — Auto-detects OS locale with support for English, French, Spanish, German, and Portuguese
@@ -61,9 +63,9 @@ thermalstats --detect-only
 ## Platform Notes
 
 ### Windows
-- **Right-click → Run as administrator** for the most accurate CPU die temperatures
+- The Windows binary includes an embedded manifest that **automatically requests administrator privileges** via a UAC prompt — no need to right-click "Run as administrator"
 - Embeds [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — no manual setup needed
-- Installs [PawnIO](https://pawnio.eu) driver on first run (required by LibreHardwareMonitor for CPU MSR access). PawnIO will appear in "Add and remove programs" and can be uninstalled independently
+- Installs the free, open-source [PawnIO](https://github.com/namazso/PawnIO) driver on first run (required by LibreHardwareMonitor for CPU MSR access). PawnIO will appear in "Add and remove programs" and you'll be prompted to keep or uninstall it after the test
 - Falls back to WMI `MSAcpi_ThermalZoneTemperature` if LHM is unavailable
 - GPU temps via `nvidia-smi` (NVIDIA) or WMI fallback
 
