@@ -183,8 +183,19 @@ async fn main() -> Result<()> {
                             "\u{2713}".green(),
                             lang.pawnio_installed
                         );
+                        println!(
+                            "  {} {}",
+                            "\u{2192}".dimmed(),
+                            lang.pawnio_removable
+                        );
                     }
-                    lhm::PawnIOStatus::AlreadyInstalled => {}
+                    lhm::PawnIOStatus::AlreadyInstalled => {
+                        println!(
+                            "  {} {}",
+                            "\u{2713}".green(),
+                            lang.pawnio_detected
+                        );
+                    }
                     lhm::PawnIOStatus::Failed(ref e) => {
                         eprintln!(
                             "  {} {} {}",

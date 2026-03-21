@@ -66,33 +66,30 @@ pub fn ensure_extracted() -> (Option<PathBuf>, PawnIOStatus) {
     (Some(dir), pawnio_status)
 }
 
-/// Check if PawnIO is already installed by looking for it in the registry
-/// (the official installer writes to Add/Remove Programs).
+/// Check if PawnIO is already installed by looking for its uninstall entry
+/// in the registry (the official installer writes to Add/Remove Programs).
 fn is_pawnio_installed() -> bool {
-    let check = std::process::Command::new("reg.exe")
-        .args([
-            "query",
-            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO",
-            "/v", "InstallLocation",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
+    // Check 64-bit uninstall registry
+    let paths = [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO",
+    ];
 
-    if let Ok(output) = check {
-        if output.status.success() {
-            return true;
+    for path in &paths {
+        let check = std::process::Command::new("reg.exe")
+            .args(["query", path])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+
+        if let Ok(output) = check {
+            if output.status.success() {
+                return true;
+            }
         }
     }
 
-    // Fallback: check if the PawnIO service exists
-    let check = std::process::Command::new("sc.exe")
-        .args(["query", "PawnIO"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-
-    matches!(check, Ok(output) if output.status.success())
+    false
 }
 
 /// Ensure PawnIO is installed using the official redistributable installer.
@@ -111,6 +108,10 @@ fn ensure_pawnio(dir: &PathBuf) -> PawnIOStatus {
     }
 
     // Run the official PawnIO installer in silent mode
+    println!(
+        "  {} Installing PawnIO driver (pawnio.eu)...",
+        "\u{25b8}".cyan()
+    );
     let result = std::process::Command::new(&installer)
         .arg("-silent")
         .stdout(std::process::Stdio::null())
