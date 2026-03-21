@@ -172,6 +172,34 @@ fn ensure_pawnio(dir: &PathBuf) -> PawnIOStatus {
     }
 }
 
+/// Uninstall PawnIO using the official installer's -uninstall -silent flags.
+/// Returns Ok(()) on success, Err with message on failure.
+pub fn uninstall_pawnio() -> Result<(), String> {
+    let dir = lhm_dir().ok_or("Could not determine app data directory")?;
+    let installer = dir.join("PawnIO_setup.exe");
+    if !installer.exists() {
+        return Err("PawnIO installer not found".into());
+    }
+
+    let result = std::process::Command::new(&installer)
+        .args(["-uninstall", "-silent"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match result {
+        Ok(status) => {
+            let code = status.code().unwrap_or(-1);
+            if code == 0 || code == 3010 {
+                Ok(())
+            } else {
+                Err(format!("Installer exited with code {}", code))
+            }
+        }
+        Err(e) => Err(format!("Failed to run installer: {}", e)),
+    }
+}
+
 fn extract_bundle(dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Cursor, Read};
 

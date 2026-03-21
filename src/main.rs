@@ -163,6 +163,8 @@ async fn main() -> Result<()> {
 
     // Extract embedded LibreHardwareMonitor for accurate CPU die temps
     let lhm_dir: Option<std::path::PathBuf>;
+    #[cfg(windows)]
+    let mut pawnio_was_installed = false;
 
     #[cfg(windows)]
     {
@@ -178,6 +180,7 @@ async fn main() -> Result<()> {
                 // Show PawnIO installation status
                 match pawnio_status {
                     lhm::PawnIOStatus::Installed => {
+                        pawnio_was_installed = true;
                         println!(
                             "  {} {}",
                             "\u{2713}".green(),
@@ -447,6 +450,13 @@ async fn main() -> Result<()> {
     }
 
     println!("\n{}", lang.done.green().bold());
+
+    // Ask user if they want to keep PawnIO (only if we just installed it this session)
+    #[cfg(windows)]
+    if pawnio_was_installed {
+        prompt_pawnio_uninstall(&lang);
+    }
+
     wait_for_exit(&lang);
     Ok(())
 }
@@ -659,6 +669,91 @@ fn prompt_ambient_temp(lang: &lang::Lang) -> Option<f64> {
             None
         }
     }
+}
+
+/// Prompt user to keep or uninstall PawnIO after the test completes.
+/// Defaults to keeping it installed if no response within 30 seconds.
+#[cfg(windows)]
+fn prompt_pawnio_uninstall(lang: &lang::Lang) {
+    use std::sync::mpsc;
+
+    println!("\n{}", "\u{2500}".repeat(50).dimmed());
+    println!(
+        "\n  {} {}",
+        "\u{2139}".cyan().bold(),
+        lang.pawnio_keep_prompt
+    );
+    println!(
+        "\n    {} {}",
+        "1)".green().bold(),
+        lang.pawnio_keep_yes
+    );
+    println!(
+        "    {} {}",
+        "2)".yellow().bold(),
+        lang.pawnio_keep_no
+    );
+
+    let timeout = 30;
+    let (tx, rx) = mpsc::channel();
+
+    // Spawn a thread to read input without blocking the countdown
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            let _ = tx.send(input.trim().to_string());
+        }
+    });
+
+    // Countdown with live prompt update
+    for remaining in (1..=timeout).rev() {
+        let prompt = lang.pawnio_enter_choice.replace("{}", &remaining.to_string());
+        print!("\r  {} ", prompt);
+        io::stdout().flush().ok();
+
+        // Check for input every second
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(input) => {
+                println!();
+                if input == "2" {
+                    println!(
+                        "  {} {}",
+                        "\u{25b8}".cyan(),
+                        lang.pawnio_uninstalling
+                    );
+                    match lhm::uninstall_pawnio() {
+                        Ok(()) => println!(
+                            "  {} {}",
+                            "\u{2713}".green(),
+                            lang.pawnio_uninstalled
+                        ),
+                        Err(e) => eprintln!(
+                            "  {} {} {}",
+                            "\u{26a0}".yellow(),
+                            lang.pawnio_uninstall_failed,
+                            e
+                        ),
+                    }
+                } else {
+                    println!(
+                        "  {} {}",
+                        "\u{2713}".green(),
+                        lang.pawnio_kept
+                    );
+                }
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+
+    // Timeout — keep installed
+    println!(
+        "\n  {} {}",
+        "\u{2713}".green(),
+        lang.pawnio_kept
+    );
 }
 
 /// Auto-close after 30 seconds with countdown, or exit early with Ctrl-C

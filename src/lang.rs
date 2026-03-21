@@ -123,6 +123,17 @@ pub struct Lang {
     pub closing_in: &'static str,
     pub goodbye: &'static str,
     pub opening_browser: &'static str,
+
+    // PawnIO post-test prompt
+    pub pawnio_keep_prompt: &'static str,
+    pub pawnio_keep_yes: &'static str,
+    pub pawnio_keep_no: &'static str,
+    pub pawnio_keep_timeout: &'static str,
+    pub pawnio_enter_choice: &'static str,
+    pub pawnio_kept: &'static str,
+    pub pawnio_uninstalling: &'static str,
+    pub pawnio_uninstalled: &'static str,
+    pub pawnio_uninstall_failed: &'static str,
 }
 
 pub fn detect_locale(override_lang: Option<&str>) -> String {
@@ -250,6 +261,15 @@ impl Lang {
             closing_in: "Closing in {}s...",
             goodbye: "Goodbye!",
             opening_browser: "Opening results in your browser...",
+            pawnio_keep_prompt: "Do you want to leave the PawnIO driver installed? It's a lightweight, free,\n  open-source driver useful for hardware monitoring. (https://github.com/namazso/PawnIO)",
+            pawnio_keep_yes: "Yes, keep installed",
+            pawnio_keep_no: "No, uninstall",
+            pawnio_keep_timeout: "No response in {}s — PawnIO will remain installed.",
+            pawnio_enter_choice: "Enter choice (1-2) — defaults to 1 in {}s:",
+            pawnio_kept: "PawnIO driver will remain installed.",
+            pawnio_uninstalling: "Uninstalling PawnIO driver...",
+            pawnio_uninstalled: "PawnIO driver uninstalled.",
+            pawnio_uninstall_failed: "PawnIO uninstall failed:",
         }
     }
 
@@ -345,6 +365,15 @@ impl Lang {
             closing_in: "Fermeture dans {}s...",
             goodbye: "Au revoir !",
             opening_browser: "Ouverture des r\u{00e9}sultats dans votre navigateur...",
+            pawnio_keep_prompt: "Voulez-vous laisser le pilote PawnIO install\u{00e9} ? C'est un pilote l\u{00e9}ger, gratuit\n  et open-source utile pour la surveillance mat\u{00e9}rielle. (https://github.com/namazso/PawnIO)",
+            pawnio_keep_yes: "Oui, garder install\u{00e9}",
+            pawnio_keep_no: "Non, d\u{00e9}sinstaller",
+            pawnio_keep_timeout: "Pas de r\u{00e9}ponse en {}s \u{2014} PawnIO restera install\u{00e9}.",
+            pawnio_enter_choice: "Entrez votre choix (1-2) \u{2014} par d\u{00e9}faut 1 dans {}s :",
+            pawnio_kept: "Le pilote PawnIO restera install\u{00e9}.",
+            pawnio_uninstalling: "D\u{00e9}sinstallation du pilote PawnIO...",
+            pawnio_uninstalled: "Pilote PawnIO d\u{00e9}sinstall\u{00e9}.",
+            pawnio_uninstall_failed: "\u{00c9}chec de la d\u{00e9}sinstallation de PawnIO :",
         }
     }
 
@@ -440,6 +469,15 @@ impl Lang {
             closing_in: "Cerrando en {}s...",
             goodbye: "\u{00a1}Adi\u{00f3}s!",
             opening_browser: "Abriendo resultados en su navegador...",
+            pawnio_keep_prompt: "\u{00bf}Desea dejar el controlador PawnIO instalado? Es un controlador ligero, gratuito\n  y de c\u{00f3}digo abierto \u{00fa}til para monitoreo de hardware. (https://github.com/namazso/PawnIO)",
+            pawnio_keep_yes: "S\u{00ed}, mantener instalado",
+            pawnio_keep_no: "No, desinstalar",
+            pawnio_keep_timeout: "Sin respuesta en {}s \u{2014} PawnIO permanecer\u{00e1} instalado.",
+            pawnio_enter_choice: "Ingrese su opci\u{00f3}n (1-2) \u{2014} por defecto 1 en {}s:",
+            pawnio_kept: "El controlador PawnIO permanecer\u{00e1} instalado.",
+            pawnio_uninstalling: "Desinstalando controlador PawnIO...",
+            pawnio_uninstalled: "Controlador PawnIO desinstalado.",
+            pawnio_uninstall_failed: "Error al desinstalar PawnIO:",
         }
     }
 
@@ -535,6 +573,15 @@ impl Lang {
             closing_in: "Schlie\u{00df}t in {}s...",
             goodbye: "Auf Wiedersehen!",
             opening_browser: "Ergebnisse werden im Browser ge\u{00f6}ffnet...",
+            pawnio_keep_prompt: "M\u{00f6}chten Sie den PawnIO-Treiber installiert lassen? Er ist ein leichtgewichtiger,\n  kostenloser Open-Source-Treiber f\u{00fc}r Hardware-\u{00dc}berwachung. (https://github.com/namazso/PawnIO)",
+            pawnio_keep_yes: "Ja, installiert lassen",
+            pawnio_keep_no: "Nein, deinstallieren",
+            pawnio_keep_timeout: "Keine Antwort in {}s \u{2014} PawnIO bleibt installiert.",
+            pawnio_enter_choice: "Auswahl eingeben (1-2) \u{2014} Standard 1 in {}s:",
+            pawnio_kept: "PawnIO-Treiber bleibt installiert.",
+            pawnio_uninstalling: "PawnIO-Treiber wird deinstalliert...",
+            pawnio_uninstalled: "PawnIO-Treiber deinstalliert.",
+            pawnio_uninstall_failed: "PawnIO-Deinstallation fehlgeschlagen:",
         }
     }
 
@@ -630,6 +677,15 @@ impl Lang {
             closing_in: "Fechando em {}s...",
             goodbye: "Adeus!",
             opening_browser: "Abrindo resultados no seu navegador...",
+            pawnio_keep_prompt: "Deseja manter o driver PawnIO instalado? \u{00c9} um driver leve, gratuito\n  e de c\u{00f3}digo aberto \u{00fa}til para monitoramento de hardware. (https://github.com/namazso/PawnIO)",
+            pawnio_keep_yes: "Sim, manter instalado",
+            pawnio_keep_no: "N\u{00e3}o, desinstalar",
+            pawnio_keep_timeout: "Sem resposta em {}s \u{2014} PawnIO permanecer\u{00e1} instalado.",
+            pawnio_enter_choice: "Insira sua escolha (1-2) \u{2014} padr\u{00e3}o 1 em {}s:",
+            pawnio_kept: "O driver PawnIO permanecer\u{00e1} instalado.",
+            pawnio_uninstalling: "Desinstalando driver PawnIO...",
+            pawnio_uninstalled: "Driver PawnIO desinstalado.",
+            pawnio_uninstall_failed: "Falha ao desinstalar PawnIO:",
         }
     }
 }
