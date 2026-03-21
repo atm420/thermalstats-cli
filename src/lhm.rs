@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use colored::Colorize;
 
-const LHM_VERSION: &str = "0.9.6.1";
+const LHM_VERSION: &str = "0.9.6.2";
 
 // The LHM bundle zip is embedded at compile time
 const LHM_BUNDLE: &[u8] = include_bytes!("../lhm/lhm-bundle.zip");
@@ -60,6 +60,9 @@ pub fn ensure_extracted() -> (Option<PathBuf>, PawnIOStatus) {
         let _ = std::fs::write(&version_file, LHM_VERSION);
     }
 
+    // Clean up old manually-installed PawnIO driver (from pre-1.0.3 versions)
+    cleanup_old_pawnio_driver(&dir);
+
     // Ensure PawnIO driver is available via the official installer
     let pawnio_status = ensure_pawnio(&dir);
 
@@ -92,11 +95,48 @@ fn is_pawnio_installed() -> bool {
     false
 }
 
+/// Clean up old PawnIO driver that was manually installed by pre-1.0.3 versions.
+/// This removes the raw driver files and stops/deletes the manually-created service.
+fn cleanup_old_pawnio_driver(dir: &PathBuf) {
+    // Remove old pawnio/ subdirectory with raw .sys/.inf/.cat files
+    let old_dir = dir.join("pawnio");
+    if old_dir.exists() {
+        let _ = std::fs::remove_dir_all(&old_dir);
+    }
+
+    // If PawnIO is running as a manually-installed service but NOT in Add/Remove Programs,
+    // it was installed by an old version — stop and remove it
+    let in_registry = is_pawnio_installed();
+    if !in_registry {
+        let sc_check = std::process::Command::new("sc.exe")
+            .args(["query", "PawnIO"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+
+        if let Ok(output) = sc_check {
+            if output.status.success() {
+                // Old manual service exists — stop and remove it
+                let _ = std::process::Command::new("sc.exe")
+                    .args(["stop", "PawnIO"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("sc.exe")
+                    .args(["delete", "PawnIO"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
 /// Ensure PawnIO is installed using the official redistributable installer.
 /// The installer is bundled with permission from the PawnIO developer and
-/// supports silent installation via the -silent flag.
+/// supports silent installation via the -install -silent flags.
 fn ensure_pawnio(dir: &PathBuf) -> PawnIOStatus {
-    // Check if PawnIO is already installed
+    // Check if PawnIO is already installed (official installer in Add/Remove Programs)
     if is_pawnio_installed() {
         return PawnIOStatus::AlreadyInstalled;
     }
@@ -113,7 +153,7 @@ fn ensure_pawnio(dir: &PathBuf) -> PawnIOStatus {
         "\u{25b8}".cyan()
     );
     let result = std::process::Command::new(&installer)
-        .arg("-silent")
+        .args(["-install", "-silent"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
