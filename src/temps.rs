@@ -505,3 +505,149 @@ fn read_gpu_temp_macos() -> Option<f64> {
 
     None
 }
+
+// ─── Debug Diagnostic Functions ─────────────────────────────────────
+
+/// Debug: test WMI MSAcpi temperature method and return detailed result
+#[cfg(windows)]
+pub fn debug_read_cpu_temp_wmi() -> String {
+    use wmi::{COMLibrary, WMIConnection};
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct ThermalZone {
+        #[serde(rename = "CurrentTemperature")]
+        current_temperature: Option<u32>,
+    }
+
+    let com = match COMLibrary::without_security() {
+        Ok(c) => c,
+        Err(e) => return format!("COM init failed: {}", e),
+    };
+    let wmi = match WMIConnection::with_namespace_path("root\\WMI", com) {
+        Ok(w) => w,
+        Err(e) => return format!("WMI root\\WMI connection failed: {} (requires admin)", e),
+    };
+
+    let results: Result<Vec<ThermalZone>, _> = wmi
+        .raw_query("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
+
+    match results {
+        Ok(zones) => {
+            if zones.is_empty() {
+                return "No thermal zones found".to_string();
+            }
+            let mut out = format!("Found {} zone(s):", zones.len());
+            for (i, z) in zones.iter().enumerate() {
+                if let Some(t) = z.current_temperature {
+                    let celsius = (t as f64 / 10.0) - 273.15;
+                    out.push_str(&format!(" Zone{}: {:.1}°C (raw: {})", i, celsius, t));
+                } else {
+                    out.push_str(&format!(" Zone{}: null", i));
+                }
+            }
+            out
+        }
+        Err(e) => format!("Query failed: {}", e),
+    }
+}
+
+/// Debug: test OHM/LHM WMI namespace method and return detailed result
+#[cfg(windows)]
+pub fn debug_read_cpu_temp_ohm() -> String {
+    use wmi::{COMLibrary, WMIConnection};
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct OhmSensor {
+        #[serde(rename = "SensorType")]
+        sensor_type: Option<String>,
+        #[serde(rename = "Value")]
+        value: Option<f32>,
+        #[serde(rename = "Name")]
+        name: Option<String>,
+    }
+
+    let com = match COMLibrary::without_security() {
+        Ok(c) => c,
+        Err(e) => return format!("COM init failed: {}", e),
+    };
+
+    for namespace in &["root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"] {
+        let wmi = match WMIConnection::with_namespace_path(namespace, com) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+
+        let results: Vec<OhmSensor> = wmi
+            .raw_query("SELECT SensorType, Value, Name FROM Sensor WHERE SensorType='Temperature'")
+            .unwrap_or_default();
+
+        if !results.is_empty() {
+            let mut out = format!("{}: {} sensor(s) —", namespace, results.len());
+            for s in &results {
+                let name = s.name.as_deref().unwrap_or("?");
+                let val = s.value.map(|v| format!("{:.1}°C", v)).unwrap_or("null".into());
+                out.push_str(&format!(" [{}={}]", name, val));
+            }
+            return out;
+        }
+    }
+
+    "No OHM/LHM WMI namespace available (neither LibreHardwareMonitor nor OpenHardwareMonitor running)".to_string()
+}
+
+/// Debug: test Performance Counter thermal zone method and return detailed result
+#[cfg(windows)]
+pub fn debug_read_cpu_temp_perfcounter() -> String {
+    use wmi::{COMLibrary, WMIConnection};
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct ThermalZonePerf {
+        #[serde(rename = "Name")]
+        name: Option<String>,
+        #[serde(rename = "HighPrecisionTemperature")]
+        high_precision_temperature: Option<u32>,
+        #[serde(rename = "Temperature")]
+        temperature: Option<u32>,
+    }
+
+    let com = match COMLibrary::without_security() {
+        Ok(c) => c,
+        Err(e) => return format!("COM init failed: {}", e),
+    };
+    let wmi = match WMIConnection::new(com) {
+        Ok(w) => w,
+        Err(e) => return format!("WMI connection failed: {}", e),
+    };
+
+    let results: Result<Vec<ThermalZonePerf>, _> = wmi
+        .raw_query("SELECT Name, HighPrecisionTemperature, Temperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation");
+
+    match results {
+        Ok(zones) => {
+            if zones.is_empty() {
+                return "No performance counter thermal zones found".to_string();
+            }
+            let mut out = format!("Found {} zone(s):", zones.len());
+            for z in &zones {
+                let name = z.name.as_deref().unwrap_or("?");
+                if let Some(hp) = z.high_precision_temperature {
+                    let celsius = (hp as f64 / 10.0) - 273.15;
+                    out.push_str(&format!(" [{}={:.1}°C (HP: {})]", name, celsius, hp));
+                } else if let Some(t) = z.temperature {
+                    let celsius = t as f64 - 273.15;
+                    out.push_str(&format!(" [{}={:.1}°C (raw: {})]", name, celsius, t));
+                } else {
+                    out.push_str(&format!(" [{}=null]", name));
+                }
+            }
+            out
+        }
+        Err(e) => format!("Query failed: {}", e),
+    }
+}

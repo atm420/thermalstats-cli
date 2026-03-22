@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
 
     // Validate test type if provided via CLI arg
     if let Some(ref test) = cli.test {
-        if !["cpu", "gpu", "both"].contains(&test.as_str()) {
+        if !["cpu", "gpu", "both", "debug"].contains(&test.as_str()) {
             eprintln!(
                 "{} {}",
                 "Error:".red().bold(),
@@ -128,6 +128,13 @@ async fn main() -> Result<()> {
         Some(t) => t,
         None => prompt_test_type(&lang),
     };
+
+    // Debug mode: completely separate flow
+    if test_type == "debug" {
+        run_debug_mode(&hw, &cli.api_url, &lang).await?;
+        wait_for_exit(&lang);
+        return Ok(());
+    }
 
     let duration_secs = match cli.duration {
         Some(d) => d,
@@ -522,6 +529,7 @@ fn prompt_test_type(lang: &lang::Lang) -> String {
     println!("  {} {}", "[1]".yellow(), lang.cpu_only);
     println!("  {} {}", "[2]".yellow(), lang.gpu_only);
     println!("  {} {}", "[3]".yellow(), lang.cpu_gpu_recommended);
+    println!("  {} {}", "[4]".yellow(), lang.debug_mode);
     print!("\n  {} [{}]: ", lang.enter_choice_test, "3".yellow());
     io::stdout().flush().ok();
 
@@ -530,6 +538,7 @@ fn prompt_test_type(lang: &lang::Lang) -> String {
     match input.trim() {
         "1" => "cpu".to_string(),
         "2" => "gpu".to_string(),
+        "4" => "debug".to_string(),
         _ => "both".to_string(),
     }
 }
@@ -776,6 +785,573 @@ fn prompt_pawnio_uninstall(lang: &lang::Lang) {
         "\u{2713}".green(),
         lang.pawnio_kept
     );
+}
+
+/// Run the full debug/diagnostic mode — tests all subsystems and creates a debug log.
+async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang::Lang) -> anyhow::Result<()> {
+    let mut log = String::new();
+
+    // Helper to log and print simultaneously
+    macro_rules! dlog {
+        ($log:expr, $($arg:tt)*) => {{
+            let line = format!($($arg)*);
+            println!("  {}", line);
+            $log.push_str(&line);
+            $log.push('\n');
+        }};
+    }
+
+    // ── Banner ──
+    println!("{}", lang.debug_banner.yellow().bold());
+    println!("  {}", lang.debug_warning_banner.yellow());
+    println!(
+        "  {} {}\n",
+        "\u{26a0}".yellow().bold(),
+        lang.debug_not_submitted.red().bold()
+    );
+    log.push_str(&format!("ThermalStats CLI Debug Log — v{}\n", VERSION));
+    log.push_str(&format!("Timestamp: {}\n\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+
+    // ── Section: Hardware ──
+    dlog!(log, "=== HARDWARE DETECTION ===");
+    dlog!(log, "CPU Model: {}", hw.cpu_model.as_deref().unwrap_or("N/A"));
+    dlog!(log, "CPU Cores: {}", hw.cpu_cores.map(|c| c.to_string()).unwrap_or("N/A".into()));
+    dlog!(log, "GPU Model: {}", hw.gpu_model.as_deref().unwrap_or("N/A"));
+    dlog!(log, "GPU VRAM: {}", hw.gpu_vram.as_deref().unwrap_or("N/A"));
+    dlog!(log, "OS: {}", hw.os.as_deref().unwrap_or("N/A"));
+    dlog!(log, "Device Type: {}", if hw.is_laptop { "Laptop" } else { "Desktop" });
+    dlog!(log, "");
+
+    // ── Section: Administrator Check ──
+    dlog!(log, "=== ADMINISTRATOR CHECK ===");
+    #[cfg(windows)]
+    {
+        let elevated = is_elevated();
+        if elevated {
+            dlog!(log, "{}", lang.debug_admin_yes);
+        } else {
+            dlog!(log, "{}", lang.debug_admin_no);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let uid = unsafe { libc::getuid() };
+        dlog!(log, "Running as root (UID 0): {}", if uid == 0 { "YES" } else { "NO" });
+    }
+    dlog!(log, "");
+
+    // ── Section: PawnIO Driver (Windows only) ──
+    #[cfg(windows)]
+    {
+        dlog!(log, "=== PAWNIO DRIVER STATUS ===");
+        // Check registry
+        let registry_found = lhm::is_pawnio_installed_public();
+        if registry_found {
+            dlog!(log, "{}", lang.debug_pawnio_registry_found);
+        } else {
+            dlog!(log, "{}", lang.debug_pawnio_registry_missing);
+        }
+
+        // Check service status via sc.exe
+        let sc_output = std::process::Command::new("sc.exe")
+            .args(["query", "PawnIO"])
+            .output();
+        match sc_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("RUNNING") {
+                    dlog!(log, "{}", lang.debug_pawnio_service_running);
+                } else if stdout.contains("STOPPED") {
+                    dlog!(log, "{}", lang.debug_pawnio_service_stopped);
+                } else {
+                    dlog!(log, "PawnIO service state: {}", stdout.trim().lines().find(|l| l.contains("STATE")).unwrap_or("UNKNOWN"));
+                }
+            }
+            _ => {
+                dlog!(log, "{}", lang.debug_pawnio_service_missing);
+            }
+        }
+
+        // Check installer presence
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let lhm_path = std::path::PathBuf::from(&appdata).join("ThermalStats").join("lhm");
+        let installer_path = lhm_path.join("PawnIO_setup.exe");
+        if installer_path.exists() {
+            dlog!(log, "{}", lang.debug_pawnio_installer_found);
+        } else {
+            dlog!(log, "{}", lang.debug_pawnio_installer_missing);
+        }
+        dlog!(log, "");
+    }
+
+    // ── Section: LHM Setup ──
+    let lhm_dir: Option<std::path::PathBuf>;
+    #[cfg(windows)]
+    {
+        dlog!(log, "=== LIBREHARDWAREMONITOR SETUP ===");
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let lhm_path = std::path::PathBuf::from(&appdata).join("ThermalStats").join("lhm");
+        if lhm_path.exists() {
+            dlog!(log, "{}", lang.debug_lhm_dir_exists);
+            dlog!(log, "Path: {}", lhm_path.display());
+
+            // List files in directory
+            if let Ok(entries) = std::fs::read_dir(&lhm_path) {
+                dlog!(log, "Contents:");
+                for entry in entries.flatten() {
+                    let meta = entry.metadata().ok();
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    dlog!(log, "  {} ({} bytes)", entry.file_name().to_string_lossy(), size);
+                }
+            }
+
+            let reader_path = lhm_path.join("ThermalReader.exe");
+            if reader_path.exists() {
+                dlog!(log, "{}", lang.debug_lhm_reader_found);
+
+                // Run ThermalReader and capture raw output
+                dlog!(log, "{}", lang.debug_lhm_raw_output);
+                let mut cmd = std::process::Command::new(&reader_path);
+                cmd.current_dir(&lhm_path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
+                match cmd.output() {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        dlog!(log, "  Exit code: {}", output.status.code().unwrap_or(-1));
+                        dlog!(log, "  Stdout: {}", if stdout.trim().is_empty() { "(empty)" } else { stdout.trim() });
+                        if !stderr.trim().is_empty() {
+                            dlog!(log, "  Stderr: {}", stderr.trim());
+                        }
+                    }
+                    Err(e) => {
+                        dlog!(log, "  Failed to execute: {}", e);
+                    }
+                }
+            } else {
+                dlog!(log, "{}", lang.debug_lhm_reader_missing);
+            }
+        } else {
+            dlog!(log, "{}", lang.debug_lhm_dir_missing);
+            dlog!(log, "Expected path: {}", lhm_path.display());
+        }
+
+        // Try extraction if elevated
+        if is_elevated() {
+            dlog!(log, "Attempting LHM extraction (elevated)...");
+            let (dir, pawnio_status) = lhm::ensure_extracted();
+            dlog!(log, "Extraction result: dir={}, pawnio={:?}", dir.is_some(), pawnio_status);
+            lhm_dir = dir;
+        } else {
+            lhm_dir = if lhm_path.join("ThermalReader.exe").exists() { Some(lhm_path) } else { None };
+        }
+        dlog!(log, "");
+    }
+    #[cfg(not(windows))]
+    {
+        lhm_dir = None;
+    }
+
+    // ── Section: WMI Check (Windows) ──
+    #[cfg(windows)]
+    {
+        dlog!(log, "=== WMI AVAILABILITY ===");
+        use wmi::{COMLibrary, WMIConnection};
+        match COMLibrary::without_security() {
+            Ok(com) => {
+                dlog!(log, "COM library: OK");
+                match WMIConnection::new(com) {
+                    Ok(_) => dlog!(log, "{}", lang.debug_wmi_available),
+                    Err(e) => dlog!(log, "{} ({})", lang.debug_wmi_unavailable, e),
+                }
+                // Try root\WMI namespace
+                let com2 = COMLibrary::without_security().ok();
+                if let Some(com2) = com2 {
+                    match WMIConnection::with_namespace_path("root\\WMI", com2) {
+                        Ok(_) => dlog!(log, "WMI root\\WMI namespace: AVAILABLE"),
+                        Err(e) => dlog!(log, "WMI root\\WMI namespace: UNAVAILABLE ({})", e),
+                    }
+                }
+            }
+            Err(e) => {
+                dlog!(log, "COM library initialization: FAILED ({})", e);
+            }
+        }
+        dlog!(log, "");
+    }
+
+    // ── Section: nvidia-smi ──
+    dlog!(log, "=== GPU DRIVER TOOLS ===");
+    let nvidia_output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,driver_version,temperature.gpu", "--format=csv,noheader"])
+        .output();
+    match nvidia_output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            dlog!(log, "{}", lang.debug_nvidia_found);
+            dlog!(log, "  Output: {}", stdout.trim());
+        }
+        _ => {
+            dlog!(log, "{}", lang.debug_nvidia_missing);
+        }
+    }
+
+    // Check rocm-smi for AMD
+    let rocm_output = std::process::Command::new("rocm-smi")
+        .args(["--showtemp"])
+        .output();
+    match rocm_output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            dlog!(log, "rocm-smi: FOUND");
+            dlog!(log, "  Output: {}", stdout.trim().lines().take(5).collect::<Vec<_>>().join("\n  "));
+        }
+        _ => {
+            dlog!(log, "rocm-smi: NOT FOUND");
+        }
+    }
+    dlog!(log, "");
+
+    // ── Section: Potential Blockers ──
+    dlog!(log, "=== POTENTIAL BLOCKING FACTORS ===");
+    #[cfg(windows)]
+    {
+        // Check for antivirus/security software
+        dlog!(log, "{}", lang.debug_antivirus_check);
+        let av_output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct | Select-Object -ExpandProperty displayName"])
+            .output();
+        match av_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let av_names = stdout.trim();
+                if av_names.is_empty() {
+                    dlog!(log, "  None detected via SecurityCenter2");
+                } else {
+                    for av in av_names.lines() {
+                        dlog!(log, "  - {}", av.trim());
+                    }
+                }
+            }
+            _ => {
+                dlog!(log, "  Could not query SecurityCenter2");
+            }
+        }
+
+        // Check Windows Firewall
+        dlog!(log, "{}", lang.debug_firewall_check);
+        let fw_output = std::process::Command::new("netsh")
+            .args(["advfirewall", "show", "allprofiles", "state"])
+            .output();
+        match fw_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.contains("State") || trimmed.contains("Profile") || trimmed.contains("Estado") {
+                        dlog!(log, "  {}", trimmed);
+                    }
+                }
+            }
+            _ => {
+                dlog!(log, "  Could not query firewall status");
+            }
+        }
+
+        // Check if Controlled Folder Access is on (can block exe execution)
+        let cfa_output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                "(Get-MpPreference).EnableControlledFolderAccess"])
+            .output();
+        match cfa_output {
+            Ok(output) if output.status.success() => {
+                let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                dlog!(log, "Controlled Folder Access: {}", if val == "1" || val.to_lowercase() == "true" { "ENABLED (may block sensor readers)" } else { "Disabled" });
+            }
+            _ => {
+                dlog!(log, "Controlled Folder Access: could not determine");
+            }
+        }
+
+        // Check SmartScreen
+        let ss_output = std::process::Command::new("reg.exe")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer", "/v", "SmartScreenEnabled"])
+            .output();
+        match ss_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                dlog!(log, "SmartScreen: {}", stdout.lines().find(|l| l.contains("SmartScreen")).unwrap_or("Unknown").trim());
+            }
+            _ => {
+                dlog!(log, "SmartScreen: could not determine");
+            }
+        }
+    }
+    dlog!(log, "");
+
+    // ── Section: Temperature Method Testing ──
+    dlog!(log, "=== TEMPERATURE METHOD TESTING ===");
+
+    // Test CPU temps all methods
+    dlog!(log, "-- CPU Temperature Methods --");
+
+    // LHM method
+    if let Some(ref dir) = lhm_dir {
+        dlog!(log, "Method: LibreHardwareMonitor (LHM via ThermalReader.exe)");
+        if let Some(reading) = lhm::read_temps(dir) {
+            dlog!(log, "  CPU: {}", reading.cpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+            dlog!(log, "  GPU: {}", reading.gpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+        } else {
+            dlog!(log, "  {}", lang.debug_temp_failed);
+        }
+    } else {
+        dlog!(log, "Method: LHM — skipped (not available)");
+    }
+
+    // WMI MSAcpi method
+    #[cfg(windows)]
+    {
+        dlog!(log, "Method: WMI MSAcpi_ThermalZoneTemperature");
+        let wmi_temp = temps::debug_read_cpu_temp_wmi();
+        dlog!(log, "  {}", wmi_temp);
+
+        dlog!(log, "Method: WMI OHM/LHM namespace");
+        let ohm_temp = temps::debug_read_cpu_temp_ohm();
+        dlog!(log, "  {}", ohm_temp);
+
+        dlog!(log, "Method: Performance Counter Thermal Zones");
+        let perf_temp = temps::debug_read_cpu_temp_perfcounter();
+        dlog!(log, "  {}", perf_temp);
+    }
+
+    // GPU temps
+    dlog!(log, "-- GPU Temperature Methods --");
+    dlog!(log, "Method: nvidia-smi (hotspot)");
+    let nvidia_hs = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=temperature.gpu_hotspot", "--format=csv,noheader,nounits"])
+        .output();
+    match nvidia_hs {
+        Ok(output) if output.status.success() => {
+            dlog!(log, "  Result: {}°C", String::from_utf8_lossy(&output.stdout).trim());
+        }
+        _ => {
+            dlog!(log, "  {}", lang.debug_temp_failed);
+        }
+    }
+
+    dlog!(log, "Method: nvidia-smi (core)");
+    let nvidia_core = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .output();
+    match nvidia_core {
+        Ok(output) if output.status.success() => {
+            dlog!(log, "  Result: {}°C", String::from_utf8_lossy(&output.stdout).trim());
+        }
+        _ => {
+            dlog!(log, "  {}", lang.debug_temp_failed);
+        }
+    }
+
+    // Composite read via normal path
+    dlog!(log, "Method: Composite (normal code path)");
+    let composite = temps::read_temperatures_with_lhm(lhm_dir.as_ref());
+    dlog!(log, "  CPU: {}", composite.cpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "  GPU: {}", composite.gpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "");
+
+    // ── Section: 30-second Stress Test ──
+    dlog!(log, "=== 30-SECOND DIAGNOSTIC STRESS TEST ===");
+    println!(
+        "\n  {} {}",
+        "\u{25b8}".cyan().bold(),
+        lang.debug_stress_starting.yellow().bold()
+    );
+    println!(
+        "  {} {}",
+        "\u{26a0}".yellow().bold(),
+        lang.debug_not_submitted.red()
+    );
+
+    let duration = Duration::from_secs(30);
+    let stress_result = stress::run_stress_test(
+        "both",
+        duration,
+        lhm_dir.as_ref(),
+        lang.spawned_cpu_threads,
+        lang.starting_gpu_stress,
+        lang.webgpu_fallback,
+        lang.complete,
+    ).await;
+
+    // Post-stress temperature
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let post_stress = temps::read_temperatures_with_lhm(lhm_dir.as_ref());
+
+    let final_cpu = match (post_stress.cpu_temp, stress_result.cpu_temp_peak) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let final_gpu = match (post_stress.gpu_temp, stress_result.gpu_temp_peak) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+
+    dlog!(log, "Stress test complete.");
+    dlog!(log, "Pre-stress (idle) temps — CPU: {} | GPU: {}",
+        composite.cpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()),
+        composite.gpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "Post-stress (load) temps — CPU: {} | GPU: {}",
+        final_cpu.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()),
+        final_gpu.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "Peak CPU temp during stress: {}",
+        stress_result.cpu_temp_peak.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "Peak GPU temp during stress: {}",
+        stress_result.gpu_temp_peak.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    dlog!(log, "Max CPU usage: {}",
+        stress_result.cpu_usage_max.map(|u| format!("{:.1}%", u)).unwrap_or("N/A".into()));
+    dlog!(log, "Max GPU usage: {}",
+        stress_result.gpu_usage_max.map(|u| format!("{:.1}%", u)).unwrap_or("N/A".into()));
+
+    // Stale temp detection
+    if let (Some(idle), Some(load)) = (composite.cpu_temp, final_cpu) {
+        let delta = (load - idle).abs();
+        if delta < 3.0 && stress_result.cpu_usage_max.unwrap_or(0.0) > 80.0 {
+            dlog!(log, "WARNING: CPU temp delta ({:.1}°C) is very small despite high usage — likely reading board sensor, not CPU die.", delta);
+        }
+    }
+    dlog!(log, "");
+
+    // ── Section: Validation Summary ──
+    dlog!(log, "=== VALIDATION SUMMARY ===");
+    let cpu_temp_ok = composite.cpu_temp.is_some() && final_cpu.is_some() &&
+        composite.cpu_temp.unwrap() != final_cpu.unwrap();
+    let gpu_temp_ok = composite.gpu_temp.is_some() && final_gpu.is_some();
+    dlog!(log, "CPU temperature sensor: {}", if cpu_temp_ok { "WORKING" } else { "ISSUE DETECTED" });
+    dlog!(log, "GPU temperature sensor: {}", if gpu_temp_ok { "WORKING" } else { "ISSUE DETECTED" });
+    dlog!(log, "CPU stress threads: {}", if stress_result.cpu_usage_max.unwrap_or(0.0) > 50.0 { "WORKING" } else { "LOW USAGE" });
+    dlog!(log, "GPU stress: {}", if stress_result.gpu_usage_max.is_some() { "WORKING" } else { "NOT DETECTED" });
+    #[cfg(windows)]
+    {
+        dlog!(log, "Admin elevation: {}", if is_elevated() { "YES" } else { "NO — recommend re-running as admin" });
+    }
+    dlog!(log, "");
+
+    // ── Display diagnostic results ──
+    println!("\n{}", "\u{2501}".repeat(50).dimmed());
+    println!(
+        "  {}",
+        lang.debug_results_debug_only.green().bold()
+    );
+    println!("{}", "\u{2501}".repeat(50).dimmed());
+    if let Some(idle_cpu) = composite.cpu_temp {
+        println!("  {} {:.1}\u{00b0}C", lang.cpu_idle_label, idle_cpu);
+    }
+    if let Some(load_cpu) = final_cpu {
+        println!("  {} {:.1}\u{00b0}C", lang.cpu_load_label, load_cpu);
+    }
+    if let Some(idle_gpu) = composite.gpu_temp {
+        println!("  {} {:.1}\u{00b0}C", lang.gpu_idle_label, idle_gpu);
+    }
+    if let Some(load_gpu) = final_gpu {
+        println!("  {} {:.1}\u{00b0}C", lang.gpu_load_label, load_gpu);
+    }
+    if let Some(cpu_usage) = stress_result.cpu_usage_max {
+        println!("  {} {:.0}%", lang.cpu_max_usage, cpu_usage);
+    }
+    if let Some(gpu_usage) = stress_result.gpu_usage_max {
+        println!("  {} {:.0}%", lang.gpu_max_usage, gpu_usage);
+    }
+    println!("{}", "\u{2501}".repeat(50).dimmed());
+    println!(
+        "\n  {} {}",
+        "\u{26a0}".yellow().bold(),
+        lang.debug_not_submitted.red().bold()
+    );
+
+    // ── Submit debug log ──
+    println!(
+        "\n  {} {}",
+        "\u{25b8}".cyan().bold(),
+        lang.debug_submitting_log
+    );
+
+    let payload = submit::DebugLogPayload {
+        log: log,
+        cpu_model: hw.cpu_model.clone(),
+        gpu_model: hw.gpu_model.clone(),
+        os: hw.os.clone(),
+        cli_version: Some(VERSION.to_string()),
+    };
+
+    let debug_api_url = api_url;
+    match submit::submit_debug_log(debug_api_url, &payload).await {
+        Ok(id) => {
+            let base_url = if debug_api_url == DEFAULT_API_URL {
+                SITE_URL
+            } else {
+                debug_api_url.trim_end_matches("/api/submissions")
+            };
+            let log_url = format!("{}/debug/{}", base_url, id);
+            println!(
+                "  {} {} {}",
+                "\u{2713}".green().bold(),
+                lang.debug_log_url,
+                log_url.cyan()
+            );
+            open_browser(&log_url, lang);
+        }
+        Err(submit::SubmitError::Connection(msg)) => {
+            // Try localhost fallback
+            if debug_api_url == DEFAULT_API_URL {
+                match submit::submit_debug_log(LOCAL_API_URL, &payload).await {
+                    Ok(id) => {
+                        let log_url = format!("{}/debug/{}", LOCAL_SITE_URL, id);
+                        println!(
+                            "  {} {} {}",
+                            "\u{2713}".green().bold(),
+                            lang.debug_log_url,
+                            log_url.cyan()
+                        );
+                        open_browser(&log_url, lang);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {} {} {}",
+                            "\u{2717}".red().bold(),
+                            lang.debug_log_failed,
+                            e
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "  {} {} {}",
+                    "\u{2717}".red().bold(),
+                    lang.debug_log_failed,
+                    msg
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {} {}",
+                "\u{2717}".red().bold(),
+                lang.debug_log_failed,
+                e
+            );
+        }
+    }
+
+    println!("\n{}", lang.done.green().bold());
+
+    Ok(())
 }
 
 /// Auto-close after 30 seconds with countdown, or exit early with Ctrl-C

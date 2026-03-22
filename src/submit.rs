@@ -86,3 +86,49 @@ pub async fn submit_results(api_url: &str, payload: &SubmissionPayload) -> Resul
 
     Ok(result.id)
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugLogPayload {
+    pub log: String,
+    pub cpu_model: Option<String>,
+    pub gpu_model: Option<String>,
+    pub os: Option<String>,
+    pub cli_version: Option<String>,
+}
+
+pub async fn submit_debug_log(api_url: &str, payload: &DebugLogPayload) -> Result<String, SubmitError> {
+    let debug_url = api_url.replace("/api/submissions", "/api/debug-logs");
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(&debug_url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", format!("ThermalStats-CLI/{}", env!("CARGO_PKG_VERSION")))
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| SubmitError::Connection(format!("Failed to connect to ThermalStats API: {}", e)))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or(body);
+        return Err(SubmitError::ApiRejected {
+            status: status.as_u16(),
+            message,
+        });
+    }
+
+    let result: SubmissionResponse = response
+        .json()
+        .await
+        .map_err(|e| SubmitError::Connection(format!("Failed to parse API response: {}", e)))?;
+
+    Ok(result.id)
+}

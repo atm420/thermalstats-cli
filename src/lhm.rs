@@ -69,6 +69,11 @@ pub fn ensure_extracted() -> (Option<PathBuf>, PawnIOStatus) {
     (Some(dir), pawnio_status)
 }
 
+/// Public wrapper for checking if PawnIO is installed (for debug mode)
+pub fn is_pawnio_installed_public() -> bool {
+    is_pawnio_installed()
+}
+
 /// Check if PawnIO is already installed by looking for its uninstall entry
 /// in the registry (the official installer writes to Add/Remove Programs).
 fn is_pawnio_installed() -> bool {
