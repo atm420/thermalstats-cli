@@ -342,6 +342,7 @@ async fn main() -> Result<()> {
     println!("{}", "\u{2501}".repeat(50).dimmed());
 
     // Detect stale CPU temp (board sensor didn't change during stress)
+    let mut skip_submit = false;
     #[cfg(windows)]
     if let (Some(idle_cpu), Some(load_cpu)) = (idle_temps.cpu_temp, final_load_temps.cpu_temp) {
         if (load_cpu - idle_cpu).abs() < 3.0 && stress_result.cpu_usage_max.unwrap_or(0.0) > 80.0 {
@@ -355,11 +356,21 @@ async fn main() -> Result<()> {
                 "\u{2192}".dimmed(),
                 lang.rerun_admin
             );
+            // If temps are exactly equal, submission would be rejected — skip it
+            if (load_cpu - idle_cpu).abs() < f64::EPSILON {
+                skip_submit = true;
+            }
         }
     }
 
     // Step 6: Submit results
-    if !cli.no_submit {
+    if skip_submit {
+        println!(
+            "\n  {} {}",
+            "\u{26a0}".yellow(),
+            lang.stale_temps_skip
+        );
+    } else if !cli.no_submit {
         println!("\n{}", format!("\u{25b8} {}", lang.submitting).cyan().bold());
         let payload = submit::SubmissionPayload {
             test_type: test_type.clone(),
@@ -402,8 +413,19 @@ async fn main() -> Result<()> {
                 );
                 open_browser(&results_url, &lang);
             }
-            Err(e) => {
-                // If production URL failed, try localhost automatically
+            Err(submit::SubmitError::ApiRejected { status, message }) => {
+                // API responded but rejected the submission — show the actual reason
+                eprintln!(
+                    "  {} {} {} (HTTP {})",
+                    "\u{2717}".red().bold(),
+                    lang.api_rejected,
+                    message,
+                    status
+                );
+                eprintln!("  {}", lang.not_saved_online.dimmed());
+            }
+            Err(submit::SubmitError::Connection(msg)) => {
+                // Network/connection error — try localhost fallback
                 if cli.api_url == DEFAULT_API_URL {
                     println!(
                         "  {} {}",
@@ -436,7 +458,7 @@ async fn main() -> Result<()> {
                         "  {} {} {}",
                         "\u{2717}".red().bold(),
                         lang.failed_submit,
-                        e
+                        msg
                     );
                     eprintln!("  {}", lang.not_saved_online.dimmed());
                 }

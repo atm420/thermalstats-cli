@@ -1,5 +1,24 @@
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+#[derive(Debug)]
+pub enum SubmitError {
+    Connection(String),
+    ApiRejected { status: u16, message: String },
+}
+
+impl fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubmitError::Connection(msg) => write!(f, "{}", msg),
+            SubmitError::ApiRejected { status, message } => {
+                write!(f, "HTTP {}: {}", status, message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,7 +52,7 @@ pub struct SubmissionResponse {
     pub id: String,
 }
 
-pub async fn submit_results(api_url: &str, payload: &SubmissionPayload) -> Result<String> {
+pub async fn submit_results(api_url: &str, payload: &SubmissionPayload) -> Result<String, SubmitError> {
     let client = reqwest::Client::new();
 
     let response = client
@@ -43,23 +62,27 @@ pub async fn submit_results(api_url: &str, payload: &SubmissionPayload) -> Resul
         .json(payload)
         .send()
         .await
-        .context("Failed to connect to ThermalStats API")?;
+        .map_err(|e| SubmitError::Connection(format!("Failed to connect to ThermalStats API: {}", e)))?;
 
     let status = response.status();
 
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "API returned status {}: {}",
-            status.as_u16(),
-            body
-        );
+        // Try to extract the error message from JSON response
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or(body);
+        return Err(SubmitError::ApiRejected {
+            status: status.as_u16(),
+            message,
+        });
     }
 
     let result: SubmissionResponse = response
         .json()
         .await
-        .context("Failed to parse API response")?;
+        .map_err(|e| SubmitError::Connection(format!("Failed to parse API response: {}", e)))?;
 
     Ok(result.id)
 }
