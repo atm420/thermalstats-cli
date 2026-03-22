@@ -34,13 +34,15 @@ pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReadi
     }
 
     // GPU temp: prefer nvidia-smi, fall back to LHM (AMD GPUs on Windows) or sysfs (Linux)
-    let mut gpu_temp = read_gpu_temp();
+    let gpu_temp = read_gpu_temp();
 
     // If nvidia-smi didn't work, try LHM GPU temp (covers AMD/Intel GPUs on Windows)
     #[cfg(windows)]
-    if gpu_temp.is_none() {
-        gpu_temp = _lhm_gpu_temp;
-    }
+    let gpu_temp = if gpu_temp.is_none() {
+        _lhm_gpu_temp
+    } else {
+        gpu_temp
+    };
 
     TemperatureReading { cpu_temp, gpu_temp }
 }

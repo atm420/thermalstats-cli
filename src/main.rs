@@ -349,6 +349,7 @@ async fn main() -> Result<()> {
     println!("{}", "\u{2501}".repeat(50).dimmed());
 
     // Detect stale CPU temp (board sensor didn't change during stress)
+    #[allow(unused_mut)]
     let mut skip_submit = false;
     #[cfg(windows)]
     if let (Some(idle_cpu), Some(load_cpu)) = (idle_temps.cpu_temp, final_load_temps.cpu_temp) {
@@ -833,11 +834,6 @@ async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang:
             dlog!(log, "{}", lang.debug_admin_no);
         }
     }
-    #[cfg(not(windows))]
-    {
-        let uid = unsafe { libc::getuid() };
-        dlog!(log, "Running as root (UID 0): {}", if uid == 0 { "YES" } else { "NO" });
-    }
     dlog!(log, "");
 
     // ── Section: PawnIO Driver (Windows only) ──
@@ -1103,16 +1099,19 @@ async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang:
     dlog!(log, "-- CPU Temperature Methods --");
 
     // LHM method
-    if let Some(ref dir) = lhm_dir {
-        dlog!(log, "Method: LibreHardwareMonitor (LHM via ThermalReader.exe)");
-        if let Some(reading) = lhm::read_temps(dir) {
-            dlog!(log, "  CPU: {}", reading.cpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
-            dlog!(log, "  GPU: {}", reading.gpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+    #[cfg(windows)]
+    {
+        if let Some(ref dir) = lhm_dir {
+            dlog!(log, "Method: LibreHardwareMonitor (LHM via ThermalReader.exe)");
+            if let Some(reading) = lhm::read_temps(dir) {
+                dlog!(log, "  CPU: {}", reading.cpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+                dlog!(log, "  GPU: {}", reading.gpu_temp.map(|t| format!("{:.1}°C", t)).unwrap_or("N/A".into()));
+            } else {
+                dlog!(log, "  {}", lang.debug_temp_failed);
+            }
         } else {
-            dlog!(log, "  {}", lang.debug_temp_failed);
+            dlog!(log, "Method: LHM — skipped (not available)");
         }
-    } else {
-        dlog!(log, "Method: LHM — skipped (not available)");
     }
 
     // WMI MSAcpi method
