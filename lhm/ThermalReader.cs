@@ -47,14 +47,14 @@ class ThermalReader
                 if (isGpu)
                 {
                     gpuName = hw.Name;
-                    gpuTemp = FindTemp(hw, "Core", "GPU", "Hot Spot");
+                    gpuTemp = FindTemp(hw, "Hot Spot", "Core", "GPU");
 
                     foreach (IHardware sub in hw.SubHardware)
                     {
                         sub.Update();
                         if (!gpuTemp.HasValue)
                         {
-                            gpuTemp = FindTemp(sub, "Core", "GPU", "Hot Spot");
+                            gpuTemp = FindTemp(sub, "Hot Spot", "Core", "GPU");
                         }
                     }
                 }

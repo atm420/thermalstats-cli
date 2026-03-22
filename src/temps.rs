@@ -395,6 +395,22 @@ fn read_gpu_temp() -> Option<f64> {
 }
 
 fn read_gpu_temp_nvidia_smi() -> Option<f64> {
+    // Try hotspot temperature first (RTX 30-series and newer)
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=temperature.gpu_hotspot", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(temp) = stdout.trim().lines().next().and_then(|l| l.trim().parse::<f64>().ok()) {
+            if temp > 0.0 && temp < 150.0 {
+                return Some(temp);
+            }
+        }
+    }
+
+    // Fall back to core/edge temperature
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
         .output()
