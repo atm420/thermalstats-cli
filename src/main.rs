@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long)]
     ambient_temp: Option<f64>,
 
-    /// Language override: en, fr, es, de, pt (auto-detected from OS if omitted)
+    /// Language override: en, fr, es, de, pt, tr, ru, ko, ar (auto-detected from OS if omitted)
     #[arg(long)]
     lang: Option<String>,
 }
