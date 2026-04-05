@@ -340,6 +340,75 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
     })
 }
 
+/// Diagnostic: dump the first 64 bytes of each candidate HWiNFO mapping
+/// as hex + ASCII, plus a parsed interpretation. Used in debug mode when
+/// the signature check fails, so we can see what's actually in memory.
+pub fn debug_raw_header() -> String {
+    let mut out = String::new();
+    for name in &["Global\\HWiNFO_SENS_SM2", "HWiNFO_SENS_SM2", "Local\\HWiNFO_SENS_SM2"] {
+        out.push_str(&format!("Mapping '{}': ", name));
+        let Some(mapping) = open_mapping(name) else {
+            out.push_str("not found\n");
+            continue;
+        };
+        // SAFETY: valid mapping, reading first 64 bytes
+        let bytes: [u8; 64] = unsafe {
+            let ptr = mapping.view as *const u8;
+            let slice = std::slice::from_raw_parts(ptr, 64);
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(slice);
+            arr
+        };
+        out.push_str("FOUND\n");
+        // Hex dump
+        out.push_str("  Hex:   ");
+        for b in &bytes[..32] {
+            out.push_str(&format!("{:02x} ", b));
+        }
+        out.push('\n');
+        // ASCII dump (first 32 bytes)
+        out.push_str("  ASCII: ");
+        for b in &bytes[..32] {
+            let c = if *b >= 0x20 && *b < 0x7f { *b as char } else { '.' };
+            out.push_str(&format!(" {} ", c));
+        }
+        out.push('\n');
+        // Parsed interpretation (treat as packed HWiNFO header)
+        out.push_str(&format!(
+            "  Signature: '{}{}{}{}'\n",
+            if bytes[0] >= 0x20 && bytes[0] < 0x7f { bytes[0] as char } else { '.' },
+            if bytes[1] >= 0x20 && bytes[1] < 0x7f { bytes[1] as char } else { '.' },
+            if bytes[2] >= 0x20 && bytes[2] < 0x7f { bytes[2] as char } else { '.' },
+            if bytes[3] >= 0x20 && bytes[3] < 0x7f { bytes[3] as char } else { '.' },
+        ));
+        out.push_str(&format!(
+            "  Version: {}, Revision: {}\n",
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        ));
+        // Try both layouts
+        out.push_str(&format!(
+            "  [packed]  sensor_off={}, sensor_sz={}, n_sensor={}, reading_off={}, reading_sz={}, n_reading={}\n",
+            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+        ));
+        out.push_str(&format!(
+            "  [aligned] sensor_off={}, sensor_sz={}, n_sensor={}, reading_off={}, reading_sz={}, n_reading={}\n",
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+        ));
+    }
+    out
+}
+
 /// Walk the shared memory and return ALL temperature readings with their
 /// parent sensor names. Used for debug dumps. Returns None on invalid data.
 unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {

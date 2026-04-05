@@ -1,6 +1,6 @@
 [package]
 name = "thermalstats"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2021"
 description = "ThermalStats CLI — stress test your CPU/GPU and submit real temperatures"
 license = "MIT"

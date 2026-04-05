@@ -1170,15 +1170,26 @@ async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang:
         match hwinfo::check_status() {
             hwinfo::HwinfoStatus::SharedMemoryReadable => {
                 dlog!(log, "Status: shared memory READABLE");
-                if let Some(reading) = hwinfo::read_temps() {
-                    dlog!(log, "  Picked CPU source: {}", reading.cpu_source.as_deref().unwrap_or("(none)"));
-                    dlog!(log, "  Picked GPU source: {}", reading.gpu_source.as_deref().unwrap_or("(none)"));
-                    dlog!(log, "  CPU temp: {}", reading.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
-                    dlog!(log, "  GPU temp: {}", reading.gpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                let reading = hwinfo::read_temps();
+                if let Some(ref r) = reading {
+                    dlog!(log, "  Picked CPU source: {}", r.cpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  Picked GPU source: {}", r.gpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  CPU temp: {}", r.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                    dlog!(log, "  GPU temp: {}", r.gpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                } else {
+                    dlog!(log, "  read_temps() returned None (signature/layout validation failed)");
                 }
-                dlog!(log, "  All HWiNFO temperature readings:");
-                for s in hwinfo::dump_temps() {
+                let dump = hwinfo::dump_temps();
+                dlog!(log, "  All HWiNFO temperature readings ({} entries):", dump.len());
+                for s in dump {
                     dlog!(log, "    [{}] {} = {:.1}\u{00b0}C", s.sensor_name, s.label, s.value);
+                }
+                // Raw header bytes — used to diagnose signature/layout mismatches
+                if reading.is_none() {
+                    dlog!(log, "  Raw mapping contents:");
+                    for line in hwinfo::debug_raw_header().lines() {
+                        dlog!(log, "  {}", line);
+                    }
                 }
             }
             hwinfo::HwinfoStatus::ProcessRunningNoSharedMem => {
