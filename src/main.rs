@@ -179,7 +179,19 @@ async fn main() -> Result<()> {
     {
         // If the user already has HWiNFO running with shared memory enabled,
         // we can read sensors directly — no admin prompt, no driver install.
-        if hwinfo::is_available() {
+        let hwinfo_status = hwinfo::check_status();
+        if hwinfo_status == hwinfo::HwinfoStatus::ProcessRunningNoSharedMem {
+            // HWiNFO is running but Shared Memory Support is disabled —
+            // nudge the user to enable it so the next run can skip PawnIO.
+            println!(
+                "\n  {} {}",
+                "\u{2139}".cyan().bold(),
+                lang.hwinfo_sm_disabled
+            );
+            println!("  {} {}", "\u{2192}".dimmed(), lang.hwinfo_enable_sm_hint);
+        }
+
+        if hwinfo_status == hwinfo::HwinfoStatus::SharedMemoryReadable {
             println!(
                 "\n  {} {}",
                 "\u{2713}".green().bold(),

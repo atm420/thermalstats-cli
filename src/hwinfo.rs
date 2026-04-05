@@ -50,6 +50,40 @@ pub fn is_available() -> bool {
     false
 }
 
+/// Result of checking for HWiNFO on the system.
+#[derive(Debug, PartialEq)]
+pub enum HwinfoStatus {
+    /// Shared memory is accessible — we can read sensors directly.
+    SharedMemoryReadable,
+    /// HWiNFO process is running but shared memory is not accessible
+    /// (user needs to enable Shared Memory Support in Sensor Settings).
+    ProcessRunningNoSharedMem,
+    /// HWiNFO is not running.
+    NotRunning,
+}
+
+/// Detect HWiNFO state: running with SM, running without SM, or not running.
+pub fn check_status() -> HwinfoStatus {
+    if is_available() {
+        return HwinfoStatus::SharedMemoryReadable;
+    }
+    if is_process_running() {
+        return HwinfoStatus::ProcessRunningNoSharedMem;
+    }
+    HwinfoStatus::NotRunning
+}
+
+/// Check if HWiNFO.exe or HWiNFO64.exe is running.
+fn is_process_running() -> bool {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+    sys.processes().values().any(|p| {
+        let name = p.name().to_string_lossy().to_ascii_lowercase();
+        name.starts_with("hwinfo") && name.ends_with(".exe")
+    })
+}
+
 /// Read current CPU/GPU temperatures from HWiNFO shared memory.
 /// Returns None if HWiNFO isn't running or shared memory is disabled.
 pub fn read_temps() -> Option<HwinfoReading> {
