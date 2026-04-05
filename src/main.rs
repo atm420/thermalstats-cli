@@ -11,6 +11,8 @@ mod submit;
 mod lang;
 #[cfg(windows)]
 mod lhm;
+#[cfg(windows)]
+mod hwinfo;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_API_URL: &str = "https://thermalstats.com/api/submissions";
@@ -175,7 +177,16 @@ async fn main() -> Result<()> {
 
     #[cfg(windows)]
     {
-        if is_elevated() {
+        // If the user already has HWiNFO running with shared memory enabled,
+        // we can read sensors directly — no admin prompt, no driver install.
+        if hwinfo::is_available() {
+            println!(
+                "\n  {} {}",
+                "\u{2713}".green().bold(),
+                lang.hwinfo_detected
+            );
+            lhm_dir = None;
+        } else if is_elevated() {
             println!(
                 "\n  {} {}",
                 "\u{25b8}".cyan(),

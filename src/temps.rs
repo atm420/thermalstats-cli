@@ -14,13 +14,25 @@ pub struct TemperatureReading {
 pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReading {
     let mut cpu_temp = None;
     let mut _lhm_gpu_temp: Option<f64> = None;
+    #[allow(unused_mut)]
+    let mut hwinfo_gpu_temp: Option<f64> = None;
 
-    // Try LHM first for CPU die temperature (requires admin, Windows only)
+    // Try HWiNFO shared memory first — zero-install, no admin required
+    // (Windows only; user must have HWiNFO running with shared memory enabled)
     #[cfg(windows)]
-    if let Some(dir) = lhm_dir {
-        if let Some(reading) = crate::lhm::read_temps(dir) {
-            cpu_temp = reading.cpu_temp;
-            _lhm_gpu_temp = reading.gpu_temp;
+    if let Some(reading) = crate::hwinfo::read_temps() {
+        cpu_temp = reading.cpu_temp;
+        hwinfo_gpu_temp = reading.gpu_temp;
+    }
+
+    // Try LHM next for CPU die temperature (requires admin, Windows only)
+    #[cfg(windows)]
+    if cpu_temp.is_none() {
+        if let Some(dir) = lhm_dir {
+            if let Some(reading) = crate::lhm::read_temps(dir) {
+                cpu_temp = reading.cpu_temp;
+                _lhm_gpu_temp = reading.gpu_temp;
+            }
         }
     }
 
@@ -33,16 +45,12 @@ pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReadi
         cpu_temp = read_cpu_temp();
     }
 
-    // GPU temp: prefer nvidia-smi, fall back to LHM (AMD GPUs on Windows) or sysfs (Linux)
+    // GPU temp: prefer nvidia-smi, fall back to HWiNFO, then LHM/sysfs
     let gpu_temp = read_gpu_temp();
 
-    // If nvidia-smi didn't work, try LHM GPU temp (covers AMD/Intel GPUs on Windows)
+    // If nvidia-smi didn't work, try HWiNFO then LHM GPU temp (covers AMD/Intel GPUs on Windows)
     #[cfg(windows)]
-    let gpu_temp = if gpu_temp.is_none() {
-        _lhm_gpu_temp
-    } else {
-        gpu_temp
-    };
+    let gpu_temp = gpu_temp.or(hwinfo_gpu_temp).or(_lhm_gpu_temp);
 
     TemperatureReading { cpu_temp, gpu_temp }
 }
