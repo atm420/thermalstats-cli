@@ -15,14 +15,33 @@ pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReadi
     let mut cpu_temp = None;
     let mut _lhm_gpu_temp: Option<f64> = None;
     #[allow(unused_mut)]
-    let mut hwinfo_gpu_temp: Option<f64> = None;
+    let mut sm_gpu_temp: Option<f64> = None;
 
-    // Try HWiNFO shared memory first — zero-install, no admin required
-    // (Windows only; user must have HWiNFO running with shared memory enabled)
+    // Try shared-memory sources first — zero-install, no admin required.
+    // Priority: HWiNFO → MSI Afterburner → AIDA64 → Core Temp (CPU-only).
     #[cfg(windows)]
-    if let Some(reading) = crate::hwinfo::read_temps() {
-        cpu_temp = reading.cpu_temp;
-        hwinfo_gpu_temp = reading.gpu_temp;
+    {
+        if let Some(reading) = crate::hwinfo::read_temps() {
+            cpu_temp = cpu_temp.or(reading.cpu_temp);
+            sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
+        }
+        if cpu_temp.is_none() || sm_gpu_temp.is_none() {
+            if let Some(reading) = crate::afterburner::read_temps() {
+                cpu_temp = cpu_temp.or(reading.cpu_temp);
+                sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
+            }
+        }
+        if cpu_temp.is_none() || sm_gpu_temp.is_none() {
+            if let Some(reading) = crate::aida64::read_temps() {
+                cpu_temp = cpu_temp.or(reading.cpu_temp);
+                sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
+            }
+        }
+        if cpu_temp.is_none() {
+            if let Some(reading) = crate::coretemp::read_temps() {
+                cpu_temp = reading.cpu_temp;
+            }
+        }
     }
 
     // Try LHM next for CPU die temperature (requires admin, Windows only)
@@ -40,17 +59,17 @@ pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReadi
     #[cfg(not(windows))]
     let _ = lhm_dir;
 
-    // Fall back to platform-specific methods if LHM didn't return CPU temp
+    // Fall back to platform-specific methods if none of the above returned a CPU temp
     if cpu_temp.is_none() {
         cpu_temp = read_cpu_temp();
     }
 
-    // GPU temp: prefer nvidia-smi, fall back to HWiNFO, then LHM/sysfs
+    // GPU temp: prefer nvidia-smi, fall back to shared-memory sources, then LHM/sysfs
     let gpu_temp = read_gpu_temp();
 
-    // If nvidia-smi didn't work, try HWiNFO then LHM GPU temp (covers AMD/Intel GPUs on Windows)
+    // If nvidia-smi didn't work, use shared-memory GPU temp then LHM (covers AMD/Intel GPUs on Windows)
     #[cfg(windows)]
-    let gpu_temp = gpu_temp.or(hwinfo_gpu_temp).or(_lhm_gpu_temp);
+    let gpu_temp = gpu_temp.or(sm_gpu_temp).or(_lhm_gpu_temp);
 
     TemperatureReading { cpu_temp, gpu_temp }
 }

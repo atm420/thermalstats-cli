@@ -13,6 +13,12 @@ mod lang;
 mod lhm;
 #[cfg(windows)]
 mod hwinfo;
+#[cfg(windows)]
+mod afterburner;
+#[cfg(windows)]
+mod aida64;
+#[cfg(windows)]
+mod coretemp;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_API_URL: &str = "https://thermalstats.com/api/submissions";
@@ -207,6 +213,16 @@ async fn main() -> Result<()> {
                     println!("  {} GPU: {}", "\u{2192}".dimmed(), src.dimmed());
                 }
             }
+            lhm_dir = None;
+        } else if let Some(sm_name) = detect_shared_memory_source() {
+            // Alternative shared-memory source (Afterburner, AIDA64, Core Temp).
+            // Same deal as HWiNFO: read sensors directly, no driver install.
+            println!(
+                "\n  {} {}",
+                "\u{2713}".green().bold(),
+                lang.shared_mem_detected.replace("{}", sm_name)
+            );
+            announce_picked_sensors();
             lhm_dir = None;
         } else if is_elevated() {
             println!(
@@ -531,6 +547,53 @@ fn is_elevated() -> bool {
         .args(["session"])
         .output();
     matches!(output, Ok(o) if o.status.success())
+}
+
+/// Check whether an alternative shared-memory temp source is available
+/// (MSI Afterburner, AIDA64, Core Temp). Returns a human-readable name
+/// of the first source found, or None.
+#[cfg(windows)]
+fn detect_shared_memory_source() -> Option<&'static str> {
+    if afterburner::is_available() {
+        return Some("MSI Afterburner");
+    }
+    if aida64::is_available() {
+        return Some("AIDA64");
+    }
+    if coretemp::is_available() {
+        return Some("Core Temp");
+    }
+    None
+}
+
+/// Print the CPU/GPU sensor labels picked by whichever alternative
+/// shared-memory source is running. Used during startup so the user can
+/// see which entries we're reading from.
+#[cfg(windows)]
+fn announce_picked_sensors() {
+    if let Some(r) = afterburner::read_temps() {
+        if let Some(src) = r.cpu_source {
+            println!("  {} CPU: {}", "\u{2192}".dimmed(), src.dimmed());
+        }
+        if let Some(src) = r.gpu_source {
+            println!("  {} GPU: {}", "\u{2192}".dimmed(), src.dimmed());
+        }
+        return;
+    }
+    if let Some(r) = aida64::read_temps() {
+        if let Some(src) = r.cpu_source {
+            println!("  {} CPU: {}", "\u{2192}".dimmed(), src.dimmed());
+        }
+        if let Some(src) = r.gpu_source {
+            println!("  {} GPU: {}", "\u{2192}".dimmed(), src.dimmed());
+        }
+        return;
+    }
+    if let Some(r) = coretemp::read_temps() {
+        if let Some(src) = r.cpu_source {
+            println!("  {} CPU: {}", "\u{2192}".dimmed(), src.dimmed());
+        }
+    }
 }
 
 /// Enable ANSI escape code processing on Windows consoles.
@@ -1198,6 +1261,58 @@ async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang:
             hwinfo::HwinfoStatus::NotRunning => {
                 dlog!(log, "Status: HWiNFO not running");
             }
+        }
+        dlog!(log, "");
+
+        // MSI Afterburner (MAHM)
+        dlog!(log, "-- MSI Afterburner Shared Memory --");
+        if afterburner::is_available() {
+            dlog!(log, "Status: MAHMSharedMemory READABLE");
+            match afterburner::read_temps() {
+                Some(r) => {
+                    dlog!(log, "  Picked CPU source: {}", r.cpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  Picked GPU source: {}", r.gpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  CPU temp: {}", r.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                    dlog!(log, "  GPU temp: {}", r.gpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                }
+                None => dlog!(log, "  read_temps() returned None (signature/layout validation failed)"),
+            }
+        } else {
+            dlog!(log, "Status: not running (MAHMSharedMemory mapping not found)");
+        }
+        dlog!(log, "");
+
+        // AIDA64
+        dlog!(log, "-- AIDA64 Shared Memory --");
+        if aida64::is_available() {
+            dlog!(log, "Status: AIDA64_SensorValues READABLE");
+            match aida64::read_temps() {
+                Some(r) => {
+                    dlog!(log, "  Picked CPU source: {}", r.cpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  Picked GPU source: {}", r.gpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  CPU temp: {}", r.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                    dlog!(log, "  GPU temp: {}", r.gpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                }
+                None => dlog!(log, "  read_temps() returned None (no <temp> records parsed)"),
+            }
+        } else {
+            dlog!(log, "Status: not running (AIDA64_SensorValues mapping not found — enable in Preferences \u{2192} Hardware Monitoring \u{2192} External Applications)");
+        }
+        dlog!(log, "");
+
+        // Core Temp
+        dlog!(log, "-- Core Temp Shared Memory --");
+        if coretemp::is_available() {
+            dlog!(log, "Status: CoreTempMappingObjectEx READABLE");
+            match coretemp::read_temps() {
+                Some(r) => {
+                    dlog!(log, "  Picked CPU source: {}", r.cpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  CPU temp: {}", r.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                }
+                None => dlog!(log, "  read_temps() returned None (invalid struct layout)"),
+            }
+        } else {
+            dlog!(log, "Status: not running (CoreTempMappingObjectEx mapping not found)");
         }
         dlog!(log, "");
     }
