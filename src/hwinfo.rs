@@ -37,6 +37,33 @@ extern "system" {
 pub struct HwinfoReading {
     pub cpu_temp: Option<f64>,
     pub gpu_temp: Option<f64>,
+    /// Sensor group + label that was picked for the CPU temp (for diagnostics)
+    pub cpu_source: Option<String>,
+    /// Sensor group + label that was picked for the GPU temp (for diagnostics)
+    pub gpu_source: Option<String>,
+}
+
+/// A raw temperature reading from HWiNFO (used for diagnostics/debug dump).
+#[derive(Debug, Clone)]
+pub struct TempSample {
+    pub sensor_name: String,
+    pub label: String,
+    pub value: f64,
+}
+
+/// Return every temperature reading HWiNFO is currently exposing, tagged with
+/// its parent sensor group. Used by debug mode to help diagnose wrong-sensor
+/// picks. Returns an empty vec if HWiNFO isn't available.
+pub fn dump_temps() -> Vec<TempSample> {
+    for name in &["Global\\HWiNFO_SENS_SM2", "HWiNFO_SENS_SM2"] {
+        if let Some(mapping) = open_mapping(name) {
+            // SAFETY: valid mapping, signature/offsets validated inside parse_all
+            if let Some(samples) = unsafe { parse_all(mapping.view as *const u8) } {
+                return samples;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Quick check: is the HWiNFO shared memory mapping available?
@@ -246,8 +273,8 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
     // ── Scan reading elements for temperature readings ──
     const SENSOR_TYPE_TEMP: u32 = 1;
 
-    let mut cpu_best: Option<(i32, f64)> = None;
-    let mut gpu_best: Option<(i32, f64)> = None;
+    let mut cpu_best: Option<(i32, f64, String)> = None;
+    let mut gpu_best: Option<(i32, f64, String)> = None;
 
     for i in 0..header.num_reading {
         let elem_offset = header.offset_reading + i * header.size_reading;
@@ -288,15 +315,15 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
 
         // Score as CPU candidate
         if let Some(score) = score_cpu(sensor_name, &label) {
-            if cpu_best.map_or(true, |(s, _)| score > s) {
-                cpu_best = Some((score, value));
+            if cpu_best.as_ref().map_or(true, |(s, _, _)| score > *s) {
+                cpu_best = Some((score, value, format!("{} / {}", sensor_name, label)));
             }
         }
 
         // Score as GPU candidate
         if let Some(score) = score_gpu(sensor_name, &label) {
-            if gpu_best.map_or(true, |(s, _)| score > s) {
-                gpu_best = Some((score, value));
+            if gpu_best.as_ref().map_or(true, |(s, _, _)| score > *s) {
+                gpu_best = Some((score, value, format!("{} / {}", sensor_name, label)));
             }
         }
     }
@@ -306,9 +333,60 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
     }
 
     Some(HwinfoReading {
-        cpu_temp: cpu_best.map(|(_, t)| t),
-        gpu_temp: gpu_best.map(|(_, t)| t),
+        cpu_temp: cpu_best.as_ref().map(|(_, t, _)| *t),
+        gpu_temp: gpu_best.as_ref().map(|(_, t, _)| *t),
+        cpu_source: cpu_best.map(|(_, _, src)| src),
+        gpu_source: gpu_best.map(|(_, _, src)| src),
     })
+}
+
+/// Walk the shared memory and return ALL temperature readings with their
+/// parent sensor names. Used for debug dumps. Returns None on invalid data.
+unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
+    let header_slice = std::slice::from_raw_parts(base, 64);
+    if &header_slice[0..4] != b"SiWH" {
+        return None;
+    }
+    let header = try_layout(header_slice, 20).or_else(|| try_layout(header_slice, 24))?;
+
+    let mut sensor_names: Vec<String> = Vec::with_capacity(header.num_sensor);
+    for i in 0..header.num_sensor {
+        let elem_offset = header.offset_sensor + i * header.size_sensor;
+        let elem = std::slice::from_raw_parts(base.add(elem_offset), header.size_sensor);
+        if elem.len() < 136 {
+            sensor_names.push(String::new());
+            continue;
+        }
+        let user_name = if elem.len() >= 264 { read_cstr(&elem[136..264]) } else { String::new() };
+        let orig_name = read_cstr(&elem[8..136]);
+        sensor_names.push(if !user_name.is_empty() { user_name } else { orig_name });
+    }
+
+    const SENSOR_TYPE_TEMP: u32 = 1;
+    let mut samples = Vec::new();
+    for i in 0..header.num_reading {
+        let elem_offset = header.offset_reading + i * header.size_reading;
+        let elem = std::slice::from_raw_parts(base.add(elem_offset), header.size_reading);
+        if elem.len() < 292 {
+            continue;
+        }
+        let reading_type = read_u32(elem, 0)?;
+        if reading_type != SENSOR_TYPE_TEMP {
+            continue;
+        }
+        let sensor_idx = read_u32(elem, 4)? as usize;
+        let label_user = read_cstr(&elem[140..268]);
+        let label_orig = read_cstr(&elem[12..140]);
+        let label = if !label_user.is_empty() { label_user } else { label_orig };
+        let value = if header.size_reading >= 320 {
+            read_f64(elem, 288)?
+        } else {
+            read_f64(elem, 284)?
+        };
+        let sensor_name = sensor_names.get(sensor_idx).cloned().unwrap_or_default();
+        samples.push(TempSample { sensor_name, label, value });
+    }
+    Some(samples)
 }
 
 /// Higher score = better CPU temperature candidate. None = not a CPU temp.

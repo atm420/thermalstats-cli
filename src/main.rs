@@ -197,6 +197,16 @@ async fn main() -> Result<()> {
                 "\u{2713}".green().bold(),
                 lang.hwinfo_detected
             );
+            // Show which sensor labels were picked — helps user diagnose
+            // cases where the wrong sensor was selected.
+            if let Some(reading) = hwinfo::read_temps() {
+                if let Some(ref src) = reading.cpu_source {
+                    println!("  {} CPU: {}", "\u{2192}".dimmed(), src.dimmed());
+                }
+                if let Some(ref src) = reading.gpu_source {
+                    println!("  {} GPU: {}", "\u{2192}".dimmed(), src.dimmed());
+                }
+            }
             lhm_dir = None;
         } else if is_elevated() {
             println!(
@@ -1151,6 +1161,34 @@ async fn run_debug_mode(hw: &hardware::HardwareInfo, api_url: &str, lang: &lang:
         dlog!(log, "Method: Performance Counter Thermal Zones");
         let perf_temp = temps::debug_read_cpu_temp_perfcounter();
         dlog!(log, "  {}", perf_temp);
+    }
+
+    // HWiNFO sensor dump (Windows only)
+    #[cfg(windows)]
+    {
+        dlog!(log, "-- HWiNFO Shared Memory --");
+        match hwinfo::check_status() {
+            hwinfo::HwinfoStatus::SharedMemoryReadable => {
+                dlog!(log, "Status: shared memory READABLE");
+                if let Some(reading) = hwinfo::read_temps() {
+                    dlog!(log, "  Picked CPU source: {}", reading.cpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  Picked GPU source: {}", reading.gpu_source.as_deref().unwrap_or("(none)"));
+                    dlog!(log, "  CPU temp: {}", reading.cpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                    dlog!(log, "  GPU temp: {}", reading.gpu_temp.map(|t| format!("{:.1}\u{00b0}C", t)).unwrap_or("N/A".into()));
+                }
+                dlog!(log, "  All HWiNFO temperature readings:");
+                for s in hwinfo::dump_temps() {
+                    dlog!(log, "    [{}] {} = {:.1}\u{00b0}C", s.sensor_name, s.label, s.value);
+                }
+            }
+            hwinfo::HwinfoStatus::ProcessRunningNoSharedMem => {
+                dlog!(log, "Status: HWiNFO running but Shared Memory Support DISABLED");
+            }
+            hwinfo::HwinfoStatus::NotRunning => {
+                dlog!(log, "Status: HWiNFO not running");
+            }
+        }
+        dlog!(log, "");
     }
 
     // GPU temps
