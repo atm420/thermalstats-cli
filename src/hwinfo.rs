@@ -241,8 +241,9 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
     // Max header size is ~48 bytes; read 64 for safety.
     let header_slice = std::slice::from_raw_parts(base, 64);
 
-    // Validate signature — HWiNFO writes ASCII "SiWH" as the first 4 bytes.
-    if &header_slice[0..4] != b"SiWH" {
+    // Validate signature — HWiNFO writes ASCII "HWiS" as the first 4 bytes
+    // (dwSignature = 0x5369_5748 little-endian).
+    if &header_slice[0..4] != b"HWiS" {
         return None;
     }
 
@@ -280,12 +281,13 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         let elem_offset = header.offset_reading + i * header.size_reading;
         let elem_ptr = base.add(elem_offset);
         let elem = std::slice::from_raw_parts(elem_ptr, header.size_reading);
-        // Reading element (packed, 316 bytes):
+        // Reading element layout (first fields are stable across HWiNFO versions):
         //   [type:4][sensor_index:4][reading_id:4]
-        //   [label_orig:128][label_user:128][unit:16]
-        //   [value:8][min:8][max:8][avg:8]
-        // If 4-byte aligned (320 bytes): 4 bytes of padding before value (at offset 288).
-        if elem.len() < 292 {
+        //   [label_orig:128][label_user:128] ...
+        //   [value:8][min:8][max:8][avg:8]  ← always the last 32 bytes
+        // Struct size varies (316 packed, 320 aligned, 460 in newer versions with
+        // extra string fields added in the middle). The numeric tail stays put.
+        if elem.len() < 276 {
             continue;
         }
 
@@ -299,12 +301,8 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         let label_orig = read_cstr(&elem[12..140]);
         let label = if !label_user.is_empty() { label_user } else { label_orig };
 
-        // Value position depends on struct size — 284 for packed, 288 for aligned.
-        let value = if header.size_reading >= 320 {
-            read_f64(elem, 288)?
-        } else {
-            read_f64(elem, 284)?
-        };
+        // Value sits at the end of the struct (4 doubles = 32 bytes tail).
+        let value = read_f64(elem, header.size_reading - 32)?;
 
         // Sanity-check the temperature
         if !(value > 0.0 && value < 150.0) {
@@ -413,7 +411,7 @@ pub fn debug_raw_header() -> String {
 /// parent sensor names. Used for debug dumps. Returns None on invalid data.
 unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
     let header_slice = std::slice::from_raw_parts(base, 64);
-    if &header_slice[0..4] != b"SiWH" {
+    if &header_slice[0..4] != b"HWiS" {
         return None;
     }
     let header = try_layout(header_slice, 20).or_else(|| try_layout(header_slice, 24))?;
@@ -436,7 +434,7 @@ unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
     for i in 0..header.num_reading {
         let elem_offset = header.offset_reading + i * header.size_reading;
         let elem = std::slice::from_raw_parts(base.add(elem_offset), header.size_reading);
-        if elem.len() < 292 {
+        if elem.len() < 276 {
             continue;
         }
         let reading_type = read_u32(elem, 0)?;
@@ -447,11 +445,7 @@ unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
         let label_user = read_cstr(&elem[140..268]);
         let label_orig = read_cstr(&elem[12..140]);
         let label = if !label_user.is_empty() { label_user } else { label_orig };
-        let value = if header.size_reading >= 320 {
-            read_f64(elem, 288)?
-        } else {
-            read_f64(elem, 284)?
-        };
+        let value = read_f64(elem, header.size_reading - 32)?;
         let sensor_name = sensor_names.get(sensor_idx).cloned().unwrap_or_default();
         samples.push(TempSample { sensor_name, label, value });
     }
