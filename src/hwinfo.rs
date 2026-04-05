@@ -281,13 +281,13 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         let elem_offset = header.offset_reading + i * header.size_reading;
         let elem_ptr = base.add(elem_offset);
         let elem = std::slice::from_raw_parts(elem_ptr, header.size_reading);
-        // Reading element layout (first fields are stable across HWiNFO versions):
+        // Reading element layout (stable across HWiNFO versions):
         //   [type:4][sensor_index:4][reading_id:4]
-        //   [label_orig:128][label_user:128] ...
-        //   [value:8][min:8][max:8][avg:8]  ← always the last 32 bytes
-        // Struct size varies (316 packed, 320 aligned, 460 in newer versions with
-        // extra string fields added in the middle). The numeric tail stays put.
-        if elem.len() < 276 {
+        //   [label_orig:128][label_user:128][unit:16]
+        //   [value:8][min:8][max:8][avg:8]
+        //   — newer versions append UTF-8 label copies *after* the 316-byte core.
+        // Packed: value at 284. Aligned (3 bytes padding before value): 288.
+        if elem.len() < 316 {
             continue;
         }
 
@@ -301,8 +301,13 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         let label_orig = read_cstr(&elem[12..140]);
         let label = if !label_user.is_empty() { label_user } else { label_orig };
 
-        // Value sits at the end of the struct (4 doubles = 32 bytes tail).
-        let value = read_f64(elem, header.size_reading - 32)?;
+        // Try packed offset 284 first; if value is nonsense, try aligned 288.
+        let v_packed = read_f64(elem, 284)?;
+        let value = if v_packed.is_finite() && v_packed > -100.0 && v_packed < 500.0 {
+            v_packed
+        } else {
+            read_f64(elem, 288)?
+        };
 
         // Sanity-check the temperature
         if !(value > 0.0 && value < 150.0) {
@@ -403,6 +408,69 @@ pub fn debug_raw_header() -> String {
             u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
             u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
         ));
+
+        // Dump one reading element (scan forward for a temp-type reading where
+        // we expect a non-zero value — e.g. GPU temp, which works w/o kernel).
+        // Use packed layout values since those validated.
+        let reading_off = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+        let reading_sz = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
+        let n_reading = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+        if reading_sz > 0 && reading_sz < 4096 && n_reading > 0 && n_reading < 10000 {
+            // SAFETY: mapping validated above; bounds checked via header values
+            let ptr = unsafe { (mapping.view as *const u8).add(reading_off) };
+            // Find a reading whose label contains "GPU" or "Hot Spot" as a proxy for
+            // a sensor that should have a non-zero value in user mode.
+            let mut picked: Option<usize> = None;
+            for i in 0..n_reading.min(200) {
+                let elem = unsafe { std::slice::from_raw_parts(ptr.add(i * reading_sz), reading_sz) };
+                if elem.len() < 268 { continue; }
+                let label = read_cstr(&elem[12..140]).to_lowercase();
+                let reading_type = u32::from_le_bytes(elem[0..4].try_into().unwrap());
+                // type 1 = temp
+                if reading_type == 1 && (label.contains("gpu") || label.contains("hot spot") || label.contains("drive")) {
+                    picked = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = picked {
+                let elem = unsafe { std::slice::from_raw_parts(ptr.add(i * reading_sz), reading_sz) };
+                let label = read_cstr(&elem[12..140]);
+                out.push_str(&format!("  Reading[{}] label='{}' size={}:\n", i, label, reading_sz));
+                // Dump bytes 260..reading_sz in 16-byte rows (covers unit+values+tail)
+                let start = 260;
+                let end = reading_sz.min(elem.len());
+                for row_start in (start..end).step_by(16) {
+                    let row_end = (row_start + 16).min(end);
+                    out.push_str(&format!("    [{:3}] ", row_start));
+                    for b in &elem[row_start..row_end] {
+                        out.push_str(&format!("{:02x} ", b));
+                    }
+                    // pad short rows
+                    for _ in 0..(16 - (row_end - row_start)) {
+                        out.push_str("   ");
+                    }
+                    out.push_str(" | ");
+                    for b in &elem[row_start..row_end] {
+                        let c = if *b >= 0x20 && *b < 0x7f { *b as char } else { '.' };
+                        out.push(c);
+                    }
+                    out.push('\n');
+                }
+                // Try f64 at every 4-byte offset from 268..end-8 and print plausible temps
+                out.push_str("    f64 candidates (offset: value):\n");
+                let scan_end = reading_sz.saturating_sub(8);
+                let mut off = 264;
+                while off <= scan_end {
+                    let val = f64::from_le_bytes(elem[off..off+8].try_into().unwrap());
+                    if val.is_finite() && val >= -50.0 && val <= 200.0 && val != 0.0 {
+                        out.push_str(&format!("      [{:3}] {:.2}\n", off, val));
+                    }
+                    off += 4;
+                }
+            } else {
+                out.push_str("  (no GPU/Drive temp reading found to dump)\n");
+            }
+        }
     }
     out
 }
@@ -434,7 +502,7 @@ unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
     for i in 0..header.num_reading {
         let elem_offset = header.offset_reading + i * header.size_reading;
         let elem = std::slice::from_raw_parts(base.add(elem_offset), header.size_reading);
-        if elem.len() < 276 {
+        if elem.len() < 316 {
             continue;
         }
         let reading_type = read_u32(elem, 0)?;
@@ -445,7 +513,12 @@ unsafe fn parse_all(base: *const u8) -> Option<Vec<TempSample>> {
         let label_user = read_cstr(&elem[140..268]);
         let label_orig = read_cstr(&elem[12..140]);
         let label = if !label_user.is_empty() { label_user } else { label_orig };
-        let value = read_f64(elem, header.size_reading - 32)?;
+        let v_packed = read_f64(elem, 284)?;
+        let value = if v_packed.is_finite() && v_packed > -100.0 && v_packed < 500.0 {
+            v_packed
+        } else {
+            read_f64(elem, 288)?
+        };
         let sensor_name = sensor_names.get(sensor_idx).cloned().unwrap_or_default();
         samples.push(TempSample { sensor_name, label, value });
     }
