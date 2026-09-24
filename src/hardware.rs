@@ -1,23 +1,27 @@
+use crate::gpus::GpuDevice;
 use sysinfo::System;
 
 #[derive(Debug, Clone)]
 pub struct HardwareInfo {
     pub cpu_model: Option<String>,
     pub cpu_cores: Option<i32>,
-    pub gpu_model: Option<String>,
-    pub gpu_vram: Option<String>,
+    pub cpu_threads: Option<i32>,
     pub os: Option<String>,
     pub is_laptop: bool,
+    /// Every physical GPU, discrete cards first.
+    pub gpus: Vec<GpuDevice>,
 }
 
 pub fn detect_hardware() -> HardwareInfo {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
 
     // CPU info — normalize the raw brand string
     let cpu_model = sys.cpus().first()
-        .map(|cpu| normalize_cpu_name(cpu.brand().trim()));
+        .map(|cpu| normalize_cpu_name(cpu.brand().trim()))
+        .filter(|name| !name.is_empty());
     let cpu_cores = Some(num_cpus::get_physical() as i32);
+    let cpu_threads = Some(num_cpus::get() as i32);
 
     // OS info
     let os = Some(format!(
@@ -26,18 +30,17 @@ pub fn detect_hardware() -> HardwareInfo {
         System::os_version().unwrap_or_default()
     ));
 
-    // GPU detection (platform-specific)
-    let (gpu_model, gpu_vram) = detect_gpu();
-
-    let is_laptop = detect_is_laptop(cpu_model.as_deref(), gpu_model.as_deref());
+    let gpus = crate::gpus::detect();
+    let gpu_names: Vec<&str> = gpus.iter().map(|g| g.name.as_str()).collect();
+    let is_laptop = detect_is_laptop(cpu_model.as_deref(), &gpu_names);
 
     HardwareInfo {
         cpu_model,
         cpu_cores,
-        gpu_model,
-        gpu_vram,
+        cpu_threads,
         os,
         is_laptop,
+        gpus,
     }
 }
 
@@ -150,257 +153,28 @@ fn regex_find_threadripper(s: &str) -> Option<String> {
     None
 }
 
-#[cfg(windows)]
-fn detect_gpu() -> (Option<String>, Option<String>) {
-    // Use WMI to query Win32_VideoController for discrete GPU info
-    use wmi::{COMLibrary, WMIConnection};
-    use serde::Deserialize;
-
-    #[derive(Deserialize, Debug)]
-    #[serde(rename_all = "PascalCase")]
-    #[allow(dead_code)]
-    struct VideoController {
-        name: Option<String>,
-        adapter_r_a_m: Option<u64>,
-        adapter_compatibility: Option<String>,
-    }
-
-    let com = match COMLibrary::new() {
-        Ok(c) => c,
-        Err(_) => return (None, None),
-    };
-    let wmi = match WMIConnection::new(com) {
-        Ok(w) => w,
-        Err(_) => return (None, None),
-    };
-
-    let controllers: Vec<VideoController> = wmi
-        .raw_query("SELECT Name, AdapterRAM, AdapterCompatibility FROM Win32_VideoController")
-        .unwrap_or_default();
-
-    // Prefer discrete GPU (NVIDIA, AMD) over integrated (Intel)
-    let discrete = controllers
-        .iter()
-        .find(|c| {
-            let compat = c.adapter_compatibility.as_deref().unwrap_or("");
-            let name = c.name.as_deref().unwrap_or("");
-            compat.contains("NVIDIA")
-                || compat.contains("AMD")
-                || compat.contains("ATI")
-                || name.contains("NVIDIA")
-                || name.contains("Radeon")
-                || name.contains("GeForce")
-        });
-
-    let gpu = discrete.or(controllers.first());
-
-    match gpu {
-        Some(vc) => {
-            let name = vc.name.clone();
-            // AdapterRAM is a 32-bit uint in WMI, overflows at 4 GB.
-            // Use nvidia-smi for NVIDIA, rocm-smi for AMD, or WMI fallback.
-            let vram = get_vram_nvidia_smi()
-                .or_else(get_vram_rocm_smi)
-                .or_else(|| {
-                    vc.adapter_r_a_m.and_then(|bytes| {
-                        // If exactly 4 GB (0xFFFFFFFF or 0x100000000), it's likely overflow
-                        if bytes >= 0xFFFF_FFFF {
-                            return None;
-                        }
-                        let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                        if gb >= 1.0 {
-                            Some(format!("{:.0} GB", gb))
-                        } else {
-                            let mb = bytes as f64 / (1024.0 * 1024.0);
-                            Some(format!("{:.0} MB", mb))
-                        }
-                    })
-                });
-            (name, vram)
-        }
-        None => (None, None),
-    }
-}
-
-/// Get VRAM via nvidia-smi (accurate, no 4 GB overflow issue)
-fn get_vram_nvidia_smi() -> Option<String> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mb: f64 = stdout.trim().lines().next()?.trim().parse().ok()?;
-    let gb = mb / 1024.0;
-    if gb >= 1.0 {
-        Some(format!("{:.0} GB", gb))
-    } else {
-        Some(format!("{:.0} MB", mb))
-    }
-}
-
-/// Get VRAM via rocm-smi for AMD GPUs
-#[allow(dead_code)]
-fn get_vram_rocm_smi() -> Option<String> {
-    let output = std::process::Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // rocm-smi outputs lines like "GPU[0] : vram Total Memory (B): 8589934592"
-    for line in stdout.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("total") && lower.contains("vram") {
-            // Extract the byte value from the end of the line
-            if let Some(bytes_str) = line.split(':').last() {
-                if let Ok(bytes) = bytes_str.trim().parse::<u64>() {
-                    let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    if gb >= 1.0 {
-                        return Some(format!("{:.0} GB", gb));
-                    } else {
-                        let mb = bytes as f64 / (1024.0 * 1024.0);
-                        return Some(format!("{:.0} MB", mb));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn detect_gpu() -> (Option<String>, Option<String>) {
-    use std::process::Command;
-
-    let output = Command::new("lspci")
-        .output()
-        .ok();
-
-    let mut gpu_name = None;
-
-    if let Some(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Look for VGA/3D controller lines
-        for line in stdout.lines() {
-            let lower = line.to_lowercase();
-            if (lower.contains("vga") || lower.contains("3d controller"))
-                && (lower.contains("nvidia") || lower.contains("amd") || lower.contains("radeon"))
-            {
-                if let Some(pos) = line.find(": ") {
-                    gpu_name = Some(line[pos + 2..].trim().to_string());
-                    break;
-                }
-            }
-        }
-        // Fallback to first VGA device
-        if gpu_name.is_none() {
-            for line in stdout.lines() {
-                if line.to_lowercase().contains("vga") {
-                    if let Some(pos) = line.find(": ") {
-                        gpu_name = Some(line[pos + 2..].trim().to_string());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    let vram = get_vram_nvidia_smi().or_else(get_vram_rocm_smi);
-    (gpu_name, vram)
-}
-
-#[cfg(target_os = "macos")]
-fn detect_gpu() -> (Option<String>, Option<String>) {
-    use std::process::Command;
-
-    // Use system_profiler to detect GPU on macOS
-    let output = Command::new("system_profiler")
-        .args(["SPDisplaysDataType", "-json"])
-        .output()
-        .ok();
-
-    if let Some(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                // Navigate: SPDisplaysDataType[0].sppci_model and spdisplays_vram
-                if let Some(displays) = json.get("SPDisplaysDataType").and_then(|d| d.as_array()) {
-                    for display in displays {
-                        let name = display.get("sppci_model")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let vram = display.get("spdisplays_vram")
-                            .or_else(|| display.get("spdisplays_vram_shared"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if name.is_some() {
-                            return (name, vram);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: try plain text output
-    let output = Command::new("system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output()
-        .ok();
-
-    if let Some(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut name = None;
-            let mut vram = None;
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("Chipset Model:") {
-                    name = trimmed.strip_prefix("Chipset Model:").map(|s| s.trim().to_string());
-                }
-                if trimmed.starts_with("VRAM") || trimmed.starts_with("Total Number of Cores") {
-                    if let Some(val) = trimmed.split(':').last() {
-                        vram = Some(val.trim().to_string());
-                    }
-                }
-            }
-            if name.is_some() {
-                return (name, vram);
-            }
-        }
-    }
-
-    (None, None)
-}
-
 /// Detect whether the system is a laptop based on CPU and GPU names.
 ///
 /// Laptop indicators:
 /// - CPU: AMD mobile suffixes (H, HX, HS, U), Intel mobile suffixes (H, HX, HK),
 ///   Intel Core Ultra mobile (H suffix), Apple Silicon (always laptop-capable)
 /// - GPU: "Laptop GPU" in name, AMD mobile GPU suffixes (M, S)
-/// - System: macOS is assumed laptop for Apple Silicon (most common case)
-fn detect_is_laptop(cpu: Option<&str>, gpu: Option<&str>) -> bool {
+/// - System: a battery is present
+fn detect_is_laptop(cpu: Option<&str>, gpus: &[&str]) -> bool {
     // GPU-based detection (most reliable)
-    if let Some(g) = gpu {
+    for g in gpus {
         let gl = g.to_lowercase();
         if gl.contains("laptop gpu") {
             return true;
         }
         // AMD mobile GPUs: RX 7900M, RX 7700S, RX 7600M XT, etc.
         if gl.contains("radeon") {
-            // Match patterns like "7900M", "7700S", "6600M"
             for part in g.split_whitespace() {
                 let p = part.trim_end_matches(|c: char| c == ',' || c == ')');
-                if p.len() >= 4 && p.ends_with('M') || p.ends_with('S') {
-                    if p[..p.len()-1].chars().all(|c| c.is_ascii_digit()) {
-                        return true;
-                    }
+                if p.len() >= 4 && (p.ends_with('M') || p.ends_with('S'))
+                    && p[..p.len() - 1].chars().all(|c| c.is_ascii_digit())
+                {
+                    return true;
                 }
             }
         }
@@ -456,39 +230,5 @@ fn detect_is_laptop(cpu: Option<&str>, gpu: Option<&str>) -> bool {
     }
 
     // Platform-level battery detection (fallback)
-    #[cfg(windows)]
-    {
-        if has_battery_windows() {
-            return true;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Check for battery in /sys/class/power_supply/
-        if std::path::Path::new("/sys/class/power_supply/BAT0").exists()
-            || std::path::Path::new("/sys/class/power_supply/BAT1").exists()
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check for battery presence on Windows via WMI
-#[cfg(windows)]
-fn has_battery_windows() -> bool {
-    use std::process::Command;
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command",
-            "(Get-WmiObject -Class Win32_Battery).Count"])
-        .output();
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Ok(count) = stdout.trim().parse::<i32>() {
-            return count > 0;
-        }
-    }
-    false
+    crate::platform::has_battery()
 }

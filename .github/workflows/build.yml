@@ -4,6 +4,8 @@
 # Builds all platform binaries on every push to main or on tag.
 # - Push to main  → builds + deploys binaries to Digital Ocean
 # - Tag v*        → builds + creates GitHub Release + deploys
+#                   (pre-release tags like v2.0.0-beta.1 are ignored —
+#                   beta builds go through beta.yml to a private folder)
 # - Manual        → builds + deploys
 #
 # Required GitHub Secrets (Settings → Secrets and variables → Actions):
@@ -24,6 +26,7 @@ on:
     branches: [main]
     tags:
       - "v*"
+      - "!v*-*"
   workflow_dispatch:
 
 permissions:
@@ -65,6 +68,25 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      # Rebuild ThermalReader.exe (LibreHardwareMonitor helper) from source with
+      # the C# compiler that ships with Windows.
+      - name: Build ThermalReader helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'lhm-bundle'
+          Expand-Archive -Path lhm/lhm-bundle.zip -DestinationPath $work -Force
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          & $csc /nologo /optimize+ /target:exe /platform:anycpu `
+            "/out:$work\ThermalReader.exe" `
+            "/reference:$work\LibreHardwareMonitorLib.dll" `
+            lhm/ThermalReader.cs
+          if ($LASTEXITCODE -ne 0) { throw "csc failed with exit code $LASTEXITCODE" }
+          Remove-Item lhm/lhm-bundle.zip
+          Compress-Archive -Path "$work\*" -DestinationPath lhm/lhm-bundle.zip
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}

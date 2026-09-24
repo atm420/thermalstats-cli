@@ -41,6 +41,8 @@ pub struct HwinfoReading {
     pub cpu_source: Option<String>,
     /// Sensor group + label that was picked for the GPU temp (for diagnostics)
     pub gpu_source: Option<String>,
+    /// GPU load (%) from the same GPU sensor group, when HWiNFO reports it
+    pub gpu_usage: Option<f64>,
 }
 
 /// A raw temperature reading from HWiNFO (used for diagnostics/debug dump).
@@ -114,10 +116,16 @@ fn is_process_running() -> bool {
 /// Read current CPU/GPU temperatures from HWiNFO shared memory.
 /// Returns None if HWiNFO isn't running or shared memory is disabled.
 pub fn read_temps() -> Option<HwinfoReading> {
+    read_filtered(&|_| true)
+}
+
+/// Like `read_temps`, but GPU readings only come from sensor groups for
+/// which `gpu_filter(sensor_name)` is true (used to pick one GPU of several).
+pub fn read_filtered(gpu_filter: &dyn Fn(&str) -> bool) -> Option<HwinfoReading> {
     // Try the Global namespace first (HWiNFO typically runs as admin),
     // then fall back to the session-local name.
     for name in &["Global\\HWiNFO_SENS_SM2", "HWiNFO_SENS_SM2"] {
-        if let Some(reading) = try_read(name) {
+        if let Some(reading) = try_read(name, gpu_filter) {
             return Some(reading);
         }
     }
@@ -158,13 +166,13 @@ fn open_mapping(name: &str) -> Option<MappedView> {
     Some(MappedView { handle, view })
 }
 
-fn try_read(name: &str) -> Option<HwinfoReading> {
+fn try_read(name: &str, gpu_filter: &dyn Fn(&str) -> bool) -> Option<HwinfoReading> {
     let mapping = open_mapping(name)?;
     // SAFETY: `mapping.view` points to a valid shared memory region owned
     // by HWiNFO. We validate the signature and all offsets/sizes before
     // dereferencing any element. The region is released when `mapping`
     // is dropped.
-    unsafe { parse(mapping.view as *const u8) }
+    unsafe { parse(mapping.view as *const u8, gpu_filter) }
 }
 
 /// Header layout (two possibilities — packed vs 4-byte aligned).
@@ -236,7 +244,7 @@ fn read_cstr(bytes: &[u8]) -> String {
 
 /// Parse shared memory starting at `base`.
 /// SAFETY: caller guarantees `base` points to a valid HWiNFO shared mapping.
-unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
+unsafe fn parse(base: *const u8, gpu_filter: &dyn Fn(&str) -> bool) -> Option<HwinfoReading> {
     // Read enough of the header to cover both layout possibilities.
     // Max header size is ~48 bytes; read 64 for safety.
     let header_slice = std::slice::from_raw_parts(base, 64);
@@ -273,9 +281,11 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
 
     // ── Scan reading elements for temperature readings ──
     const SENSOR_TYPE_TEMP: u32 = 1;
+    const SENSOR_TYPE_USAGE: u32 = 7;
 
     let mut cpu_best: Option<(i32, f64, String)> = None;
     let mut gpu_best: Option<(i32, f64, String)> = None;
+    let mut usage_best: Option<(i32, f64)> = None;
 
     for i in 0..header.num_reading {
         let elem_offset = header.offset_reading + i * header.size_reading;
@@ -292,7 +302,7 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         }
 
         let reading_type = read_u32(elem, 0)?;
-        if reading_type != SENSOR_TYPE_TEMP {
+        if reading_type != SENSOR_TYPE_TEMP && reading_type != SENSOR_TYPE_USAGE {
             continue;
         }
 
@@ -309,12 +319,23 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
             read_f64(elem, 288)?
         };
 
+        let sensor_name = sensor_names.get(sensor_idx).map(|s| s.as_str()).unwrap_or("");
+
+        if reading_type == SENSOR_TYPE_USAGE {
+            if (0.0..=100.0).contains(&value) && gpu_filter(sensor_name) {
+                if let Some(score) = score_gpu_usage(sensor_name, &label) {
+                    if usage_best.map_or(true, |(s, _)| score > s) {
+                        usage_best = Some((score, value));
+                    }
+                }
+            }
+            continue;
+        }
+
         // Sanity-check the temperature
         if !(value > 0.0 && value < 150.0) {
             continue;
         }
-
-        let sensor_name = sensor_names.get(sensor_idx).map(|s| s.as_str()).unwrap_or("");
 
         // Score as CPU candidate
         if let Some(score) = score_cpu(sensor_name, &label) {
@@ -324,6 +345,9 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         }
 
         // Score as GPU candidate
+        if !gpu_filter(sensor_name) {
+            continue;
+        }
         if let Some(score) = score_gpu(sensor_name, &label) {
             if gpu_best.as_ref().map_or(true, |(s, _, _)| score > *s) {
                 gpu_best = Some((score, value, format!("{} / {}", sensor_name, label)));
@@ -340,6 +364,7 @@ unsafe fn parse(base: *const u8) -> Option<HwinfoReading> {
         gpu_temp: gpu_best.as_ref().map(|(_, t, _)| *t),
         cpu_source: cpu_best.map(|(_, _, src)| src),
         gpu_source: gpu_best.map(|(_, _, src)| src),
+        gpu_usage: usage_best.map(|(_, v)| v),
     })
 }
 
@@ -567,6 +592,30 @@ fn score_cpu(sensor: &str, label: &str) -> Option<i32> {
     }
     if l.contains("core") && !l.contains("distance") {
         return Some(50); // per-core fallback
+    }
+    None
+}
+
+/// Higher score = better GPU load candidate. None = not overall GPU load.
+fn score_gpu_usage(sensor: &str, label: &str) -> Option<i32> {
+    if score_gpu(sensor, "temperature").is_none() {
+        return None; // not a GPU sensor group
+    }
+    let l = label.to_lowercase();
+    if l.contains("memory") || l.contains("video") || l.contains("bus") || l.contains("fb ") {
+        return None;
+    }
+    if l.contains("gpu core load") {
+        return Some(100);
+    }
+    if l.contains("gpu utilization") {
+        return Some(90);
+    }
+    if l.contains("gpu d3d usage") {
+        return Some(80);
+    }
+    if l.contains("gpu load") {
+        return Some(70);
     }
     None
 }

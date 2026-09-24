@@ -1,152 +1,117 @@
+//! Stress workloads. The CPU and GPU kernels are the same as in earlier CLI
+//! versions so temperatures stay comparable; what changed is how they are
+//! scheduled, so the rest of the system stays usable:
+//!
+//! * CPU workers run below normal priority. They still take every idle cycle
+//!   (so load and heat are unchanged) but yield to the interface, the sensor
+//!   readers and the terminal.
+//! * GPU work is submitted in short batches (~20 ms each, two in flight) so
+//!   the desktop compositor can still draw between them, instead of one long
+//!   batch that stalls the screen.
+
+use crate::gpus::GpuDevice;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuStress {
+    Off,
+    Starting,
+    Running { adapter: String, backend: String },
+    Failed(String),
+}
 
 #[derive(Debug, Clone)]
-pub struct StressResult {
-    pub cpu_usage_max: Option<f64>,
-    pub gpu_usage_max: Option<f64>,
-    pub cpu_temp_peak: Option<f64>,
-    pub gpu_temp_peak: Option<f64>,
+pub struct StressStatus {
+    pub cpu_threads: usize,
+    pub gpu: GpuStress,
 }
 
-pub async fn run_stress_test(
-    test_type: &str,
-    duration: Duration,
-    lhm_dir: Option<&std::path::PathBuf>,
-    msg_spawned_threads: &str,
-    msg_starting_gpu: &str,
-    msg_webgpu_fallback: &str,
-    msg_complete: &str,
-) -> StressResult {
-    let running = Arc::new(AtomicBool::new(true));
-    let mut cpu_usage_max: Option<f64> = None;
-    let mut gpu_usage_max: Option<f64> = None;
-    let mut cpu_temp_peak: Option<f64> = None;
-    let mut gpu_temp_peak: Option<f64> = None;
+/// True while the GPU worker is submitting work (used by --demo's simulated sensor).
+pub static GPU_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    // Clone lhm_dir for use in the monitor loop
-    let lhm_dir_owned = lhm_dir.cloned();
+pub struct StressRun {
+    running: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+    status: Arc<Mutex<StressStatus>>,
+}
 
-    // Progress bar
-    let pb = ProgressBar::new(duration.as_secs());
-    pb.set_style(
-        ProgressStyle::with_template(
-            "  [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len}s {msg}"
-        )
-        .unwrap()
-        .progress_chars("██░"),
-    );
+impl StressRun {
+    /// Start the CPU workers (one per logical core) and/or the GPU worker.
+    pub fn start(cpu: bool, gpu: Option<GpuDevice>, gpu_requested: bool) -> StressRun {
+        let running = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(Mutex::new(StressStatus {
+            cpu_threads: 0,
+            gpu: if gpu_requested { GpuStress::Starting } else { GpuStress::Off },
+        }));
+        let mut handles = Vec::new();
 
-    let start = Instant::now();
-
-    // Start CPU stress threads
-    let cpu_handles = if test_type == "cpu" || test_type == "both" {
-        let running_clone = running.clone();
-        Some(start_cpu_stress(running_clone, msg_spawned_threads))
-    } else {
-        None
-    };
-
-    // GPU stress: launch nvidia-smi powered CUDA burn via dedicated threads
-    let gpu_handles = if test_type == "gpu" || test_type == "both" {
-        let running_clone = running.clone();
-        Some(start_gpu_stress(running_clone, msg_starting_gpu, msg_webgpu_fallback))
-    } else {
-        None
-    };
-
-    // Monitor loop — update progress bar, track usage AND temperatures
-    let mut sys = sysinfo::System::new();
-    while start.elapsed() < duration {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        pb.set_position(start.elapsed().as_secs().min(duration.as_secs()));
-
-        // Read CPU usage
-        sys.refresh_cpu_usage();
-        let cpu_total: f64 = sys.cpus().iter().map(|c| c.cpu_usage() as f64).sum::<f64>()
-            / sys.cpus().len() as f64;
-        cpu_usage_max = Some(cpu_usage_max.unwrap_or(0.0_f64).max(cpu_total));
-
-        // Read GPU usage (try nvidia-smi, then rocm-smi for AMD)
-        if let Some(gpu) = read_gpu_usage() {
-            gpu_usage_max = Some(gpu_usage_max.unwrap_or(0.0_f64).max(gpu));
+        if gpu_requested {
+            let running = running.clone();
+            let status = status.clone();
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("stress-gpu".into())
+                .spawn(move || gpu_worker(&running, gpu.as_ref(), &status))
+            {
+                handles.push(handle);
+            }
         }
 
-        // Read live temperatures
-        let live_temps = crate::temps::read_temperatures_with_lhm(lhm_dir_owned.as_ref());
-        if let Some(ct) = live_temps.cpu_temp {
-            cpu_temp_peak = Some(cpu_temp_peak.unwrap_or(0.0_f64).max(ct));
-        }
-        if let Some(gt) = live_temps.gpu_temp {
-            gpu_temp_peak = Some(gpu_temp_peak.unwrap_or(0.0_f64).max(gt));
-        }
-
-        // Build status message with temps
-        let mut msg = format!("CPU: {:.0}%", cpu_total);
-        if let Some(ct) = live_temps.cpu_temp {
-            msg.push_str(&format!(" {:.0}°C", ct));
-        }
-        if let Some(gu) = gpu_usage_max {
-            msg.push_str(&format!(" | GPU: {:.0}%", gu));
-        }
-        if let Some(gt) = live_temps.gpu_temp {
-            msg.push_str(&format!(" {:.0}°C", gt));
+        if cpu {
+            let threads = num_cpus::get();
+            for thread_id in 0..threads {
+                let running = running.clone();
+                if let Ok(handle) = std::thread::Builder::new()
+                    .name(format!("stress-cpu-{}", thread_id))
+                    .spawn(move || {
+                        crate::platform::lower_thread_priority();
+                        cpu_stress_worker(thread_id, &running);
+                    })
+                {
+                    handles.push(handle);
+                }
+            }
+            lock(&status).cpu_threads = threads;
         }
 
-        pb.set_message(msg);
+        StressRun { running, handles, status }
     }
 
-    // Signal all threads to stop
-    running.store(false, Ordering::SeqCst);
-    pb.finish_with_message(msg_complete.green().to_string());
-
-    // Wait for CPU threads to finish
-    if let Some(handles) = cpu_handles {
-        for h in handles {
-            let _ = h.join();
-        }
+    pub fn status(&self) -> StressStatus {
+        lock(&self.status).clone()
     }
 
-    // Wait for GPU threads
-    if let Some(handles) = gpu_handles {
-        for h in handles {
-            let _ = h.join();
+    /// Signal all workers to stop and wait up to `timeout` for them to exit.
+    /// Workers still busy after that are left to finish on their own.
+    pub fn stop(mut self, timeout: Duration) -> StressStatus {
+        self.running.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + timeout;
+        for handle in self.handles.drain(..) {
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
-    }
-
-    StressResult {
-        cpu_usage_max,
-        gpu_usage_max,
-        cpu_temp_peak,
-        gpu_temp_peak,
+        lock(&self.status).clone()
     }
 }
 
-/// Spawns one native thread per logical CPU core running heavy math + memory stress.
-fn start_cpu_stress(running: Arc<AtomicBool>, msg_spawned: &str) -> Vec<std::thread::JoinHandle<()>> {
-    let num_threads = num_cpus::get();
-    let mut handles = Vec::with_capacity(num_threads);
-
-    for thread_id in 0..num_threads {
-        let running = running.clone();
-        let handle = std::thread::spawn(move || {
-            cpu_stress_worker(thread_id, &running);
-        });
-        handles.push(handle);
+impl Drop for StressRun {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
     }
-
-    let msg = msg_spawned.replace("{}", &num_threads.to_string());
-    println!(
-        "  {} {}",
-        "\u{2713}".green(),
-        msg
-    );
-
-    handles
 }
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ─── CPU ────────────────────────────────────────────────────────────
 
 /// Each worker runs a tight loop of heavy math + random memory access
 /// to maximize CPU utilization and generate heat.
@@ -213,50 +178,85 @@ fn cpu_stress_worker(thread_id: usize, running: &AtomicBool) {
         iteration = iteration.wrapping_add(batch_size);
 
         // Prevent dead-code elimination
-        if sink == f64::INFINITY && iteration == 0 {
-            println!("{}", sink);
-        }
+        std::hint::black_box(sink);
     }
 }
 
-/// GPU stress: runs heavy computation on the actual GPU using wgpu (WebGPU).
-/// Maps to Vulkan on Windows/Linux, Metal on macOS, DX12 as fallback.
-/// Falls back to CPU-based FP stress if no GPU is available.
-fn start_gpu_stress(running: Arc<AtomicBool>, msg_starting: &str, msg_fallback: &str) -> Vec<std::thread::JoinHandle<()>> {
-    let mut handles = Vec::new();
+// ─── GPU ────────────────────────────────────────────────────────────
 
-    match init_wgpu_stress() {
-        Ok(gpu_context) => {
-            let msg = msg_starting.replace("{}", &gpu_context.device_name);
-            println!(
-                "  {} {}",
-                "\u{2713}".green(),
-                msg
-            );
-
-            let running_clone = running.clone();
-            let handle = std::thread::spawn(move || {
-                gpu_wgpu_stress_worker(&running_clone, gpu_context);
-            });
-            handles.push(handle);
-        }
-        Err(e) => {
-            let msg = msg_fallback.replace("{}", &e.to_string());
-            println!(
-                "  {} {}",
-                "\u{26a0}".yellow(),
-                msg
-            );
-
-            let running_clone = running.clone();
-            let handle = std::thread::spawn(move || {
-                gpu_stress_worker_fallback(&running_clone);
-            });
-            handles.push(handle);
-        }
+fn backends() -> wgpu::Backends {
+    if cfg!(windows) {
+        wgpu::Backends::VULKAN | wgpu::Backends::DX12
+    } else if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
     }
+}
 
-    handles
+fn instance() -> wgpu::Instance {
+    wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: backends(),
+        ..Default::default()
+    })
+}
+
+/// Every hardware graphics adapter the stress test could use.
+pub fn list_adapters() -> Vec<wgpu::AdapterInfo> {
+    instance()
+        .enumerate_adapters(backends())
+        .into_iter()
+        .map(|a| a.get_info())
+        .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
+        .collect()
+}
+
+/// The adapter for `gpu`: same PCI IDs, else same name. Vulkan is preferred
+/// over DX12 because earlier versions stressed through Vulkan.
+fn pick_adapter(instance: &wgpu::Instance, gpu: Option<&GpuDevice>) -> Result<wgpu::Adapter, String> {
+    let adapters: Vec<wgpu::Adapter> = instance
+        .enumerate_adapters(backends())
+        .into_iter()
+        .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+        .collect();
+
+    let Some(gpu) = gpu else {
+        return pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|e| format!("No GPU adapter found: {}", e));
+    };
+
+    let score = |info: &wgpu::AdapterInfo| -> i32 {
+        let mut s = 0;
+        if gpu.vendor_id == Some(info.vendor) && gpu.device_id == Some(info.device) {
+            s += 100;
+        } else if gpu.matches_name(&info.name) {
+            s += 50;
+        } else {
+            return 0;
+        }
+        if info.backend == wgpu::Backend::Vulkan {
+            s += 5;
+        }
+        s
+    };
+
+    let best = adapters
+        .iter()
+        .map(|a| (score(&a.get_info()), a))
+        .filter(|(s, _)| *s > 0)
+        .max_by_key(|(s, _)| *s)
+        .map(|(_, a)| a.clone());
+
+    match best {
+        Some(adapter) => Ok(adapter),
+        // A single GPU whose names differ between APIs: use it.
+        None if adapters.len() == 1 => Ok(adapters[0].clone()),
+        None => Err(format!("No Vulkan/DirectX driver found for {}", gpu.name)),
+    }
 }
 
 // WGSL compute shader — heavy parallel workload adapted from the browser stress test.
@@ -306,8 +306,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-struct WgpuComputeContext {
-    device_name: String,
+struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -316,37 +315,24 @@ struct WgpuComputeContext {
     work_groups: u32,
 }
 
-/// Initialize wgpu with a compute pipeline for GPU stress
-fn init_wgpu_stress() -> Result<WgpuComputeContext, String> {
-    use wgpu::*;
+fn init_gpu(gpu: Option<&GpuDevice>) -> Result<(GpuContext, wgpu::AdapterInfo), String> {
     use wgpu::util::DeviceExt;
+    use wgpu::*;
 
-    let instance = Instance::new(&InstanceDescriptor {
-        backends: Backends::VULKAN | Backends::METAL,
-        ..Default::default()
-    });
+    let instance = instance();
+    let adapter = pick_adapter(&instance, gpu)?;
+    let info = adapter.get_info();
 
-    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-        power_preference: PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
+    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+        label: Some("thermalstats-stress"),
+        required_features: Features::empty(),
+        required_limits: Limits::default(),
+        memory_hints: MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
     }))
-    .map_err(|e| format!("No GPU adapter found: {}", e))?;
-
-    let device_name = adapter.get_info().name;
-
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &DeviceDescriptor {
-            label: Some("thermalstats-stress"),
-            required_features: Features::empty(),
-            required_limits: Limits::default(),
-            memory_hints: MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        },
-    ))
     .map_err(|e| format!("Device request failed: {}", e))?;
 
-    let shader_module: ShaderModule = device.create_shader_module(ShaderModuleDescriptor {
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("stress-shader"),
         source: ShaderSource::Wgsl(WGSL_STRESS_SHADER.into()),
     });
@@ -362,8 +348,6 @@ fn init_wgpu_stress() -> Result<WgpuComputeContext, String> {
 
     // 4M elements (16 MB) — large enough to saturate GPU
     let work_size: u64 = 4 * 1024 * 1024;
-
-    // Initialize data buffer
     let init_data: Vec<f32> = (0..work_size).map(|i| (i as f32 * 0.0001).fract()).collect();
 
     let data_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
@@ -384,45 +368,79 @@ fn init_wgpu_stress() -> Result<WgpuComputeContext, String> {
         label: Some("stress-bind-group"),
         layout: &bind_group_layout,
         entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: data_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: params_buffer.as_entire_binding(),
-            },
+            BindGroupEntry { binding: 0, resource: data_buffer.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
         ],
     });
 
     // 256 threads per workgroup
     let work_groups = (work_size as u32 + 255) / 256;
 
-    Ok(WgpuComputeContext {
-        device_name,
-        device,
-        queue,
-        pipeline,
-        bind_group,
-        params_buffer,
-        work_groups,
-    })
+    Ok((GpuContext { device, queue, pipeline, bind_group, params_buffer, work_groups }, info))
 }
 
-/// Run the wgpu stress compute shader in a loop until stopped
-fn gpu_wgpu_stress_worker(running: &AtomicBool, ctx: WgpuComputeContext) {
+fn gpu_worker(running: &AtomicBool, gpu: Option<&GpuDevice>, status: &Mutex<StressStatus>) {
+    // A driver problem must end GPU stress, never the whole app.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_gpu(running, gpu, status)));
+    let failure = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        Err(_) => Some("The graphics driver reported an error".to_string()),
+    };
+    if let Some(reason) = failure {
+        lock(status).gpu = GpuStress::Failed(reason);
+    }
+}
+
+fn run_gpu(running: &AtomicBool, gpu: Option<&GpuDevice>, status: &Mutex<StressStatus>) -> Result<(), String> {
+    let (ctx, info) = init_gpu(gpu)?;
+
+    // wgpu panics on uncaptured errors by default; record them instead.
+    let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let on_error = error.clone();
+        ctx.device.on_uncaptured_error(Box::new(move |e| {
+            *lock(&on_error) = Some(e.to_string());
+        }));
+        let on_lost = error.clone();
+        ctx.device.set_device_lost_callback(move |_, message| {
+            *lock(&on_lost) = Some(format!("GPU device lost: {}", message));
+        });
+    }
+
+    lock(status).gpu = GpuStress::Running {
+        adapter: info.name.clone(),
+        backend: format!("{:?}", info.backend),
+    };
+    GPU_ACTIVE.store(true, Ordering::Relaxed);
+    let result = gpu_loop(running, &ctx, &error);
+    GPU_ACTIVE.store(false, Ordering::Relaxed);
+    result
+}
+
+fn gpu_loop(running: &AtomicBool, ctx: &GpuContext, error: &Mutex<Option<String>>) -> Result<(), String> {
+
+    const TARGET_BATCH: Duration = Duration::from_millis(20);
+    const MAX_DISPATCHES: u32 = 256;
+
+    let start = Instant::now();
     let mut iteration = 0u32;
-    let start = std::time::Instant::now();
+    // Start small and grow: a slow iGPU must not get a multi-second first batch.
+    let mut dispatches: u32 = 1;
+    let mut in_flight: VecDeque<(wgpu::SubmissionIndex, u32)> = VecDeque::new();
+    let mut last_done = Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        let elapsed = start.elapsed().as_secs_f32();
-        let params = [elapsed, iteration as f32, 0.0f32, 0.0f32];
+        if let Some(e) = lock(error).take() {
+            return Err(e);
+        }
+
+        let params = [start.elapsed().as_secs_f32(), iteration as f32, 0.0f32, 0.0f32];
         ctx.queue.write_buffer(&ctx.params_buffer, 0, bytemuck::cast_slice(&params));
 
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("stress-encoder"),
         });
-
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("stress-pass"),
@@ -430,80 +448,35 @@ fn gpu_wgpu_stress_worker(running: &AtomicBool, ctx: WgpuComputeContext) {
             });
             pass.set_pipeline(&ctx.pipeline);
             pass.set_bind_group(0, &ctx.bind_group, &[]);
-            // Dispatch multiple times per submission for sustained load
-            for _ in 0..16 {
+            for _ in 0..dispatches {
                 pass.dispatch_workgroups(ctx.work_groups, 1, 1);
             }
         }
-
-        ctx.queue.submit(std::iter::once(encoder.finish()));
-        ctx.device.poll(wgpu::PollType::Wait).ok();
-
+        let index = ctx.queue.submit(std::iter::once(encoder.finish()));
+        in_flight.push_back((index, dispatches));
         iteration = iteration.wrapping_add(1);
-    }
-}
 
-/// Fallback GPU stress — pure CPU FP stress when no GPU is available
-fn gpu_stress_worker_fallback(running: &AtomicBool) {
-    const SIZE: usize = 4 * 1024 * 1024;
-    let mut buf_a = vec![1.0001f64; SIZE];
-    let mut buf_b = vec![0.9999f64; SIZE];
+        // Keep two batches queued so the GPU never idles between them.
+        if in_flight.len() >= 2 {
+            let (oldest, count) = in_flight.pop_front().unwrap();
+            ctx.device
+                .poll(wgpu::PollType::WaitForSubmissionIndex(oldest))
+                .map_err(|e| format!("GPU stopped responding: {}", e))?;
 
-    let mut iteration = 0u64;
-
-    while running.load(Ordering::Relaxed) {
-        let alpha = f64::sin(iteration as f64 * 0.0001) * 0.5 + 1.0;
-        for i in 0..SIZE {
-            buf_a[i] = buf_a[i].mul_add(alpha, buf_b[i]);
-            buf_b[i] = f64::sin(buf_a[i] * 0.0001) * f64::cos(buf_b[i] * 0.0001) + 0.5;
-            if i & 0xFFFF == 0 {
-                buf_a[i] = buf_a[i].fract() + 1.0;
-                buf_b[i] = buf_b[i].fract() + 1.0;
-            }
-        }
-        iteration += 1;
-    }
-}
-
-/// Read GPU usage percentage — tries nvidia-smi first, then rocm-smi for AMD GPUs
-fn read_gpu_usage() -> Option<f64> {
-    // Try NVIDIA first
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-        .output()
-        .ok();
-
-    if let Some(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(val) = stdout.trim().lines().next().and_then(|l| l.trim().parse::<f64>().ok()) {
-                return Some(val);
+            // Batches run back to back, so the gap between completions is
+            // roughly that batch's GPU time. Steer toward TARGET_BATCH.
+            let now = Instant::now();
+            let batch_time = now - last_done;
+            last_done = now;
+            let per_dispatch = batch_time.as_secs_f64() / count as f64;
+            if per_dispatch > 0.0 {
+                let ideal = (TARGET_BATCH.as_secs_f64() / per_dispatch).clamp(1.0, MAX_DISPATCHES as f64);
+                // Move halfway toward the ideal to smooth out noise.
+                dispatches = ((dispatches as f64 + ideal) / 2.0).round().max(1.0) as u32;
             }
         }
     }
 
-    // Try AMD rocm-smi
-    let output = std::process::Command::new("rocm-smi")
-        .args(["--showuse"])
-        .output()
-        .ok();
-
-    if let Some(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // rocm-smi outputs lines like "GPU[0] : GPU use (%): 98"
-            for line in stdout.lines() {
-                let lower = line.to_lowercase();
-                if lower.contains("gpu use") {
-                    if let Some(pct_str) = line.split(':').last() {
-                        if let Ok(val) = pct_str.trim().parse::<f64>() {
-                            return Some(val);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    let _ = ctx.device.poll(wgpu::PollType::Wait);
+    Ok(())
 }

@@ -1,0 +1,261 @@
+# ──────────────────────────────────────────────────────────────────
+# ThermalStats v2 — private beta builds
+#
+# Every push to the `v2` branch builds all platforms, signs the Windows
+# binary and uploads it to an unlisted folder on the site:
+#
+#   https://thermalstats.com/downloads/beta/<BETA_DOWNLOAD_TOKEN>/
+#
+# That page lists the latest build (version, commit, time) with download
+# links that bypass the Cloudflare cache. Nothing here touches the public
+# binaries in /downloads/ or creates a GitHub Release, so the current CLI
+# stays exactly as it is while v2 is tested.
+#
+# Required secret (in addition to those build.yml uses):
+#   BETA_DOWNLOAD_TOKEN — long random string used as the private folder name,
+#                         e.g. the output of: openssl rand -hex 16
+# ──────────────────────────────────────────────────────────────────
+
+name: Beta build (private link)
+
+on:
+  push:
+    branches: [v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Required for Azure OIDC authentication
+
+concurrency:
+  group: beta
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: thermalstats-beta.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: thermalstats-beta-linux
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: thermalstats-beta-macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-beta-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-beta-
+
+      # ThermalReader.exe (the LibreHardwareMonitor helper) is rebuilt from
+      # lhm/ThermalReader.cs so the bundle always matches the source. The
+      # C# 5 compiler that ships with Windows is enough — no SDK needed.
+      - name: Build ThermalReader helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'lhm-bundle'
+          Expand-Archive -Path lhm/lhm-bundle.zip -DestinationPath $work -Force
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          & $csc /nologo /optimize+ /target:exe /platform:anycpu `
+            "/out:$work\ThermalReader.exe" `
+            "/reference:$work\LibreHardwareMonitorLib.dll" `
+            lhm/ThermalReader.cs
+          if ($LASTEXITCODE -ne 0) { throw "csc failed with exit code $LASTEXITCODE" }
+          Remove-Item lhm/lhm-bundle.zip
+          Compress-Archive -Path "$work\*" -DestinationPath lhm/lhm-bundle.zip
+          Get-ChildItem $work | Format-Table Name, Length
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/thermalstats${{ runner.os == 'Windows' && '.exe' || '' }}" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 14
+
+  # Sign the Windows binary using Azure Trusted Signing (same account as releases)
+  sign-windows:
+    needs: build
+    runs-on: windows-latest
+    environment: signing
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: thermalstats-beta.exe
+          path: artifact
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign with Azure Trusted Signing
+        uses: azure/trusted-signing-action@v0.5.0
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: alextm-apps
+          certificate-profile-name: ThermalStats
+          files-folder: artifact
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Re-upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermalstats-beta.exe
+          path: artifact/thermalstats-beta.exe
+          overwrite: true
+          retention-days: 14
+
+  deploy:
+    needs: [build, sign-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check the private folder name
+        env:
+          BETA_DOWNLOAD_TOKEN: ${{ secrets.BETA_DOWNLOAD_TOKEN }}
+        run: |
+          if [ "${#BETA_DOWNLOAD_TOKEN}" -lt 16 ]; then
+            echo "::error::Set the BETA_DOWNLOAD_TOKEN secret to at least 16 random characters (e.g. openssl rand -hex 16)."
+            exit 1
+          fi
+          case "$BETA_DOWNLOAD_TOKEN" in
+            *[!A-Za-z0-9_-]*) echo "::error::BETA_DOWNLOAD_TOKEN may only contain letters, digits, '-' and '_'."; exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up SSH key
+        env:
+          DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DROPLET_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DROPLET_HOST" >> ~/.ssh/known_hosts
+
+          cat >> ~/.ssh/config << SSHEOF
+          Host deploy-target
+            HostName $DROPLET_HOST
+            User $DROPLET_USER
+            IdentityFile ~/.ssh/deploy_key
+            ServerAliveInterval 30
+            ServerAliveCountMax 10
+            StrictHostKeyChecking no
+          SSHEOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload to the private folder
+        env:
+          BETA_DOWNLOAD_TOKEN: ${{ secrets.BETA_DOWNLOAD_TOKEN }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          mkdir -p beta
+          cp artifacts/thermalstats-beta.exe/thermalstats-beta.exe beta/
+          cp artifacts/thermalstats-beta-linux/thermalstats-beta-linux beta/
+          cp artifacts/thermalstats-beta-macos/thermalstats-beta-macos beta/
+          chmod +x beta/thermalstats-beta-linux beta/thermalstats-beta-macos
+
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILT=$(date -u '+%Y-%m-%d %H:%M UTC')
+          SUBJECT=$(git log -1 --format=%s | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+          # Cloudflare caches .exe files for hours but not HTML, so this page is
+          # always current and its ?b= links skip any stale cached binary.
+          cat > beta/index.html << HTMLEOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="robots" content="noindex, nofollow">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>ThermalStats beta</title>
+          <style>
+            body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #0b0f14; color: #e6edf3; }
+            a { color: #4cc9f0; }
+            .dl a { display: block; margin: 8px 0; padding: 12px 16px; border: 1px solid #4cc9f0; border-radius: 8px; text-decoration: none; }
+            code { color: #9fb3c8; }
+          </style>
+          </head>
+          <body>
+          <h1>ThermalStats ${VERSION}</h1>
+          <p>Build #${RUN_NUMBER} &middot; <code>${COMMIT}</code> &middot; ${BUILT}<br><small>${SUBJECT}</small></p>
+          <div class="dl">
+            <a href="thermalstats-beta.exe?b=${RUN_NUMBER}" download>Windows (signed)</a>
+            <a href="thermalstats-beta-linux?b=${RUN_NUMBER}" download>Linux</a>
+            <a href="thermalstats-beta-macos?b=${RUN_NUMBER}" download>macOS (Apple Silicon)</a>
+          </div>
+          <p><small>Private test build &mdash; please don't share this page.</small></p>
+          </body>
+          </html>
+          HTMLEOF
+
+          DIR="/opt/thermalstats/standalone/public/downloads/beta/$BETA_DOWNLOAD_TOKEN"
+          ssh deploy-target "mkdir -p '$DIR'"
+          scp beta/* "deploy-target:$DIR/"
+          ssh deploy-target "chmod 755 '$DIR' && chmod 644 '$DIR/index.html' '$DIR/thermalstats-beta.exe' && chmod 755 '$DIR/thermalstats-beta-linux' '$DIR/thermalstats-beta-macos'"
+          echo "Beta build #${RUN_NUMBER} (${VERSION}, ${COMMIT}) uploaded to the private folder." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

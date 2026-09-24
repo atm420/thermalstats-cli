@@ -1,100 +1,210 @@
-use colored::Colorize;
-use std::path::PathBuf;
+//! Temperature and GPU-load sources, tried in a fixed priority order.
+//!
+//! The order matches earlier CLI versions so new results stay comparable
+//! with the existing database:
+//!   CPU (Windows): HWiNFO → MSI Afterburner → AIDA64 → Core Temp →
+//!                  LibreHardwareMonitor → WMI ACPI → OHM WMI → perf counters
+//!   GPU (Windows): NVIDIA driver → HWiNFO → Afterburner → AIDA64 → LHM → WMI
+//!
+//! Nothing here prints: the interface owns the terminal. Every reading
+//! carries a short source label that the interface shows next to it.
+
+use crate::gpus::GpuDevice;
 
 #[derive(Debug, Clone)]
-pub struct TemperatureReading {
-    pub cpu_temp: Option<f64>,
-    pub gpu_temp: Option<f64>,
+pub struct TempReading {
+    pub celsius: f64,
+    pub source: String,
 }
 
-/// Read system temperatures.
-/// If an LHM directory is provided, uses the embedded LibreHardwareMonitor
-/// for accurate CPU die temps. Falls back to WMI/PerfCounter otherwise.
-/// GPU temps prefer nvidia-smi for NVIDIA, LHM for AMD, sysfs on Linux, powermetrics on macOS.
-pub fn read_temperatures_with_lhm(lhm_dir: Option<&PathBuf>) -> TemperatureReading {
-    let mut cpu_temp = None;
-    let mut _lhm_gpu_temp: Option<f64> = None;
-    #[allow(unused_mut)]
-    let mut sm_gpu_temp: Option<f64> = None;
+impl TempReading {
+    fn new(celsius: f64, source: impl Into<String>) -> Option<Self> {
+        (celsius > 0.0 && celsius < 150.0).then(|| TempReading { celsius, source: source.into() })
+    }
+}
 
-    // Try shared-memory sources first — zero-install, no admin required.
-    // Priority: HWiNFO → MSI Afterburner → AIDA64 → Core Temp (CPU-only).
+/// Readings that come from a long-running helper rather than a direct query.
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    #[cfg(windows)]
+    pub lhm: Option<crate::lhm::LhmSample>,
+}
+
+// ─── CPU ────────────────────────────────────────────────────────────
+
+pub fn read_cpu(ctx: &Context) -> Option<TempReading> {
     #[cfg(windows)]
     {
-        if let Some(reading) = crate::hwinfo::read_temps() {
-            cpu_temp = cpu_temp.or(reading.cpu_temp);
-            sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
-        }
-        if cpu_temp.is_none() || sm_gpu_temp.is_none() {
-            if let Some(reading) = crate::afterburner::read_temps() {
-                cpu_temp = cpu_temp.or(reading.cpu_temp);
-                sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
+        // Shared-memory sources first — zero-install, no admin required.
+        if let Some(r) = crate::hwinfo::read_temps() {
+            if let Some(t) = r.cpu_temp {
+                return TempReading::new(t, format!("HWiNFO / {}", r.cpu_source.unwrap_or_default()));
             }
         }
-        if cpu_temp.is_none() || sm_gpu_temp.is_none() {
-            if let Some(reading) = crate::aida64::read_temps() {
-                cpu_temp = cpu_temp.or(reading.cpu_temp);
-                sm_gpu_temp = sm_gpu_temp.or(reading.gpu_temp);
+        if let Some(r) = crate::afterburner::read_temps() {
+            if let Some(t) = r.cpu_temp {
+                return TempReading::new(t, r.cpu_source.unwrap_or_else(|| "MSI Afterburner".into()));
             }
         }
-        if cpu_temp.is_none() {
-            if let Some(reading) = crate::coretemp::read_temps() {
-                cpu_temp = reading.cpu_temp;
+        if let Some(r) = crate::aida64::read_temps() {
+            if let Some(t) = r.cpu_temp {
+                return TempReading::new(t, r.cpu_source.unwrap_or_else(|| "AIDA64".into()));
             }
         }
+        if let Some(r) = crate::coretemp::read_temps() {
+            if let Some(t) = r.cpu_temp {
+                return TempReading::new(t, r.cpu_source.unwrap_or_else(|| "Core Temp".into()));
+            }
+        }
+        // Embedded LibreHardwareMonitor (needs admin + PawnIO)
+        if let Some(sample) = &ctx.lhm {
+            if let Some(t) = sample.cpu_temp {
+                let sensor = sample.cpu_sensor.as_deref().unwrap_or("CPU");
+                return TempReading::new(t, format!("LibreHardwareMonitor / {}", sensor));
+            }
+        }
+        if let Some(t) = read_cpu_temp_wmi() {
+            return TempReading::new(t, "ACPI thermal zone (motherboard)");
+        }
+        if let Some((t, name)) = read_cpu_temp_ohm() {
+            return TempReading::new(t, format!("Hardware monitor WMI / {}", name));
+        }
+        if let Some(t) = read_cpu_temp_perfcounter() {
+            return TempReading::new(t, "Windows thermal zone (motherboard)");
+        }
+        None
     }
 
-    // Try LHM next for CPU die temperature (requires admin, Windows only)
-    #[cfg(windows)]
-    if cpu_temp.is_none() {
-        if let Some(dir) = lhm_dir {
-            if let Some(reading) = crate::lhm::read_temps(dir) {
-                cpu_temp = reading.cpu_temp;
-                _lhm_gpu_temp = reading.gpu_temp;
-            }
-        }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = ctx;
+        read_cpu_temp_linux()
     }
 
-    // Suppress unused variable warning on non-Windows
-    #[cfg(not(windows))]
-    let _ = lhm_dir;
-
-    // Fall back to platform-specific methods if none of the above returned a CPU temp
-    if cpu_temp.is_none() {
-        cpu_temp = read_cpu_temp();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ctx;
+        read_cpu_temp_powermetrics()
+            .map(|t| TempReading { celsius: t, source: "powermetrics / CPU die".into() })
+            .or_else(|| read_cpu_temp_sysctl().map(|t| TempReading { celsius: t, source: "sysctl".into() }))
     }
-
-    // GPU temp: prefer nvidia-smi, fall back to shared-memory sources, then LHM/sysfs
-    let gpu_temp = read_gpu_temp();
-
-    // If nvidia-smi didn't work, use shared-memory GPU temp then LHM (covers AMD/Intel GPUs on Windows)
-    #[cfg(windows)]
-    let gpu_temp = gpu_temp.or(sm_gpu_temp).or(_lhm_gpu_temp);
-
-    TemperatureReading { cpu_temp, gpu_temp }
 }
 
-// ─── CPU Temperature ────────────────────────────────────────────────
+// ─── GPU ────────────────────────────────────────────────────────────
+
+/// Temperature of `gpu`. With several GPUs installed (`multi`), sources that
+/// can't tell GPUs apart are skipped rather than risk reading the wrong card.
+pub fn read_gpu(ctx: &Context, gpu: &GpuDevice, multi: bool) -> Option<TempReading> {
+    if let Some(index) = gpu.nvml_index {
+        if let Some((t, label)) = crate::nvidia::temperature(index) {
+            return TempReading::new(t, label);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = |name: &str| !multi || gpu.matches_name(name);
+        if let Some(r) = crate::hwinfo::read_filtered(&filter) {
+            if let Some(t) = r.gpu_temp {
+                return TempReading::new(t, format!("HWiNFO / {}", r.gpu_source.unwrap_or_default()));
+            }
+        }
+        if let Some(r) = crate::afterburner::read_filtered(&filter) {
+            if let Some(t) = r.gpu_temp {
+                return TempReading::new(t, r.gpu_source.unwrap_or_else(|| "MSI Afterburner".into()));
+            }
+        }
+        if !multi {
+            if let Some(r) = crate::aida64::read_temps() {
+                if let Some(t) = r.gpu_temp {
+                    return TempReading::new(t, r.gpu_source.unwrap_or_else(|| "AIDA64".into()));
+                }
+            }
+        }
+        if let Some(g) = lhm_gpu(ctx, gpu, multi) {
+            if let Some(t) = g.temp {
+                let sensor = g.sensor.as_deref().unwrap_or("GPU");
+                return TempReading::new(t, format!("LibreHardwareMonitor / {}", sensor));
+            }
+        }
+        if !multi {
+            if let Some(t) = read_gpu_temp_wmi() {
+                return TempReading::new(t, "WMI temperature probe");
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = ctx;
+        if let Some(dev) = &gpu.sysfs_device {
+            if let Some(t) = read_hwmon_temp(dev) {
+                return TempReading::new(t, "amdgpu / edge");
+            }
+        }
+        if !multi {
+            return read_gpu_temp_drm_any().and_then(|t| TempReading::new(t, "hwmon / GPU"));
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (ctx, gpu, multi);
+        read_gpu_temp_powermetrics().and_then(|t| TempReading::new(t, "powermetrics / GPU die"))
+    }
+}
+
+/// GPU load (%) for `gpu`, when some source reports it.
+pub fn read_gpu_usage(ctx: &Context, gpu: &GpuDevice, multi: bool) -> Option<f64> {
+    if let Some(index) = gpu.nvml_index {
+        if let Some(u) = crate::nvidia::utilization(index) {
+            return Some(u);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = |name: &str| !multi || gpu.matches_name(name);
+        if let Some(u) = crate::hwinfo::read_filtered(&filter).and_then(|r| r.gpu_usage) {
+            return Some(u);
+        }
+        if let Some(u) = crate::afterburner::read_filtered(&filter).and_then(|r| r.gpu_usage) {
+            return Some(u);
+        }
+        lhm_gpu(ctx, gpu, multi).and_then(|g| g.load)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (ctx, multi);
+        let dev = gpu.sysfs_device.as_ref()?;
+        std::fs::read_to_string(dev.join("gpu_busy_percent"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (ctx, multi);
+        None
+    }
+}
 
 #[cfg(windows)]
-fn read_cpu_temp() -> Option<f64> {
-    // Strategy 1: WMI MSAcpi_ThermalZoneTemperature (requires admin on most systems)
-    if let Some(temp) = read_cpu_temp_wmi() {
-        return Some(temp);
-    }
-
-    // Strategy 2: Open Hardware Monitor / LibreHardwareMonitor WMI namespace
-    if let Some(temp) = read_cpu_temp_ohm() {
-        return Some(temp);
-    }
-
-    // Strategy 3: Performance Counter thermal zones (works WITHOUT admin)
-    if let Some(temp) = read_cpu_temp_perfcounter() {
-        return Some(temp);
-    }
-
-    None
+fn lhm_gpu<'a>(ctx: &'a Context, gpu: &GpuDevice, multi: bool) -> Option<&'a crate::lhm::LhmGpu> {
+    let sample = ctx.lhm.as_ref()?;
+    sample
+        .gpus
+        .iter()
+        .find(|g| gpu.matches_name(&g.name))
+        .or_else(|| if multi { None } else { sample.gpus.last() })
 }
+
+// ─── Windows WMI fallbacks ─────────────────────────────────────────
 
 /// Read CPU-adjacent temperature from Windows Performance Counter thermal zones.
 /// Uses Win32_PerfFormattedData_Counters_ThermalZoneInformation which is
@@ -167,8 +277,9 @@ fn read_cpu_temp_wmi() -> Option<f64> {
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+/// OpenHardwareMonitor / LibreHardwareMonitor GUI running with WMI publishing.
 #[cfg(windows)]
-fn read_cpu_temp_ohm() -> Option<f64> {
+fn read_cpu_temp_ohm() -> Option<(f64, String)> {
     use wmi::{COMLibrary, WMIConnection};
     use serde::Deserialize;
 
@@ -199,258 +310,27 @@ fn read_cpu_temp_ohm() -> Option<f64> {
             .raw_query("SELECT SensorType, Value, Name FROM Sensor WHERE SensorType='Temperature'")
             .unwrap_or_default();
 
-        // Find CPU Package temperature (most representative)
-        if let Some(sensor) = results.iter().find(|s| {
+        // Find CPU Package temperature (most representative), then any CPU temperature
+        let package = results.iter().find(|s| {
             s.name
                 .as_deref()
                 .map(|n| n.contains("CPU Package") || n.contains("CPU (Tctl"))
                 .unwrap_or(false)
-        }) {
-            if let Some(v) = sensor.value {
-                return Some(v as f64);
-            }
-        }
-
-        // Fallback: any CPU temperature
-        if let Some(sensor) = results.iter().find(|s| {
+        });
+        let any_cpu = || results.iter().find(|s| {
             s.name
                 .as_deref()
                 .map(|n| n.to_lowercase().contains("cpu"))
                 .unwrap_or(false)
-        }) {
+        });
+        if let Some(sensor) = package.or_else(any_cpu) {
             if let Some(v) = sensor.value {
-                return Some(v as f64);
+                return Some((v as f64, sensor.name.clone().unwrap_or_default()));
             }
         }
     }
 
     None
-}
-
-#[cfg(target_os = "linux")]
-fn read_cpu_temp() -> Option<f64> {
-    // Strategy 1: /sys/class/thermal/ (most Linux systems)
-    if let Some(temp) = read_cpu_temp_sysfs() {
-        return Some(temp);
-    }
-
-    // Strategy 2: /sys/class/hwmon/ (coretemp, k10temp)
-    if let Some(temp) = read_cpu_temp_hwmon() {
-        return Some(temp);
-    }
-
-    println!(
-        "  {} Could not read CPU temperature. Try installing {}.",
-        "⚠".yellow(),
-        "lm-sensors".cyan()
-    );
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn read_cpu_temp() -> Option<f64> {
-    // Try powermetrics first (requires sudo, most accurate)
-    if let Some(temp) = read_cpu_temp_powermetrics() {
-        return Some(temp);
-    }
-
-    // Fallback: try reading via IOKit SMC keys (works without sudo on some systems)
-    if let Some(temp) = read_cpu_temp_smc() {
-        return Some(temp);
-    }
-
-    println!(
-        "  {} Could not read CPU temperature. Try running with {}.",
-        "⚠".yellow(),
-        "sudo".cyan()
-    );
-    None
-}
-
-/// Read CPU temperature via macOS powermetrics (requires sudo)
-#[cfg(target_os = "macos")]
-fn read_cpu_temp_powermetrics() -> Option<f64> {
-    use std::process::Command;
-
-    // powermetrics requires root, sample for 1 second
-    let output = Command::new("sudo")
-        .args(["-n", "powermetrics", "-n", "1", "-i", "1000", "--samplers", "smc"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Look for CPU die temperature line like: "CPU die temperature: 45.31 C"
-    for line in stdout.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("cpu die temperature") || lower.contains("cpu thermal level") {
-            // Extract the numeric value
-            for word in line.split_whitespace() {
-                if let Ok(temp) = word.parse::<f64>() {
-                    if temp > 0.0 && temp < 150.0 {
-                        return Some(temp);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Read CPU temperature via IOKit SMC (may work without sudo on some macOS versions)
-#[cfg(target_os = "macos")]
-fn read_cpu_temp_smc() -> Option<f64> {
-    use std::process::Command;
-
-    // Try using osx-cpu-temp if installed, or read from sysctl
-    let output = Command::new("sysctl")
-        .args(["-a"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Some macOS versions expose temperature via sysctl
-    for line in stdout.lines() {
-        if line.contains("temperature") && line.contains("CPU") {
-            for word in line.split_whitespace() {
-                if let Ok(temp) = word.parse::<f64>() {
-                    if temp > 0.0 && temp < 150.0 {
-                        return Some(temp);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_cpu_temp_sysfs() -> Option<f64> {
-    use std::fs;
-
-    // Check thermal zones
-    for i in 0..10 {
-        let type_path = format!("/sys/class/thermal/thermal_zone{}/type", i);
-        let temp_path = format!("/sys/class/thermal/thermal_zone{}/temp", i);
-
-        if let (Ok(zone_type), Ok(temp_str)) = (fs::read_to_string(&type_path), fs::read_to_string(&temp_path)) {
-            let zone_type = zone_type.trim().to_lowercase();
-            if zone_type.contains("cpu") || zone_type.contains("x86_pkg") || zone_type.contains("soc") {
-                if let Ok(millideg) = temp_str.trim().parse::<i64>() {
-                    return Some(millideg as f64 / 1000.0);
-                }
-            }
-        }
-    }
-
-    // Fallback: just use thermal_zone0 which is often CPU
-    let temp_path = "/sys/class/thermal/thermal_zone0/temp";
-    if let Ok(temp_str) = std::fs::read_to_string(temp_path) {
-        if let Ok(millideg) = temp_str.trim().parse::<i64>() {
-            return Some(millideg as f64 / 1000.0);
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_cpu_temp_hwmon() -> Option<f64> {
-    use std::fs;
-
-    // Search hwmon devices for coretemp or k10temp
-    let hwmon_dir = "/sys/class/hwmon";
-    let entries = fs::read_dir(hwmon_dir).ok()?;
-
-    for entry in entries.flatten() {
-        let name_path = entry.path().join("name");
-        if let Ok(name) = fs::read_to_string(&name_path) {
-            let name = name.trim();
-            if name == "coretemp" || name == "k10temp" || name == "zenpower" {
-                // Read temp1_input (Package/Tdie temperature)
-                let temp_path = entry.path().join("temp1_input");
-                if let Ok(temp_str) = fs::read_to_string(&temp_path) {
-                    if let Ok(millideg) = temp_str.trim().parse::<i64>() {
-                        return Some(millideg as f64 / 1000.0);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-// ─── GPU Temperature ────────────────────────────────────────────────
-
-fn read_gpu_temp() -> Option<f64> {
-    // Strategy 1: nvidia-smi (NVIDIA GPUs)
-    if let Some(temp) = read_gpu_temp_nvidia_smi() {
-        return Some(temp);
-    }
-
-    // Strategy 2: On Windows, try WMI
-    #[cfg(windows)]
-    if let Some(temp) = read_gpu_temp_wmi() {
-        return Some(temp);
-    }
-
-    // Strategy 3: On Linux, try /sys/class/drm for AMD
-    #[cfg(target_os = "linux")]
-    if let Some(temp) = read_gpu_temp_amd_sysfs() {
-        return Some(temp);
-    }
-
-    // Strategy 4: On macOS, try powermetrics for GPU temp
-    #[cfg(target_os = "macos")]
-    if let Some(temp) = read_gpu_temp_macos() {
-        return Some(temp);
-    }
-
-    println!(
-        "  {} Could not read GPU temperature. Ensure GPU drivers are installed.",
-        "⚠".yellow()
-    );
-    None
-}
-
-fn read_gpu_temp_nvidia_smi() -> Option<f64> {
-    // Try hotspot temperature first (RTX 30-series and newer)
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu_hotspot", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(temp) = stdout.trim().lines().next().and_then(|l| l.trim().parse::<f64>().ok()) {
-            if temp > 0.0 && temp < 150.0 {
-                return Some(temp);
-            }
-        }
-    }
-
-    // Fall back to core/edge temperature
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().lines().next()?.trim().parse::<f64>().ok()
 }
 
 #[cfg(windows)]
@@ -479,49 +359,91 @@ fn read_gpu_temp_wmi() -> Option<f64> {
         .map(|t| t as f64)
 }
 
+// ─── Linux ──────────────────────────────────────────────────────────
+
+/// CPU package sensors first (x86_pkg_temp, coretemp, k10temp, zenpower);
+/// thermal_zone0 — often the motherboard's ACPI zone — only as a last resort.
 #[cfg(target_os = "linux")]
-fn read_gpu_temp_amd_sysfs() -> Option<f64> {
+fn read_cpu_temp_linux() -> Option<TempReading> {
     use std::fs;
 
-    // AMD GPUs expose temp through hwmon under /sys/class/drm
-    let drm_dir = "/sys/class/drm";
-    let entries = fs::read_dir(drm_dir).ok()?;
+    for i in 0..16 {
+        let base = format!("/sys/class/thermal/thermal_zone{}", i);
+        let Ok(kind) = fs::read_to_string(format!("{}/type", base)) else { continue };
+        let kind = kind.trim().to_lowercase();
+        if kind.contains("cpu") || kind.contains("x86_pkg") || kind.contains("soc") {
+            if let Some(t) = read_millideg(&format!("{}/temp", base)) {
+                return TempReading::new(t, format!("thermal zone / {}", kind));
+            }
+        }
+    }
 
-    for entry in entries.flatten() {
-        let device_path = entry.path().join("device/hwmon");
-        if let Ok(hwmon_entries) = fs::read_dir(&device_path) {
-            for hwmon in hwmon_entries.flatten() {
-                let temp_path = hwmon.path().join("temp1_input");
-                if let Ok(temp_str) = fs::read_to_string(&temp_path) {
-                    if let Ok(millideg) = temp_str.trim().parse::<i64>() {
-                        return Some(millideg as f64 / 1000.0);
-                    }
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let name = fs::read_to_string(entry.path().join("name")).unwrap_or_default();
+            let name = name.trim();
+            if name == "coretemp" || name == "k10temp" || name == "zenpower" {
+                // temp1 is Package (Intel) / Tctl (AMD)
+                if let Some(t) = read_millideg(&entry.path().join("temp1_input").to_string_lossy()) {
+                    return TempReading::new(t, format!("hwmon / {}", name));
                 }
             }
         }
     }
 
+    read_millideg("/sys/class/thermal/thermal_zone0/temp")
+        .and_then(|t| TempReading::new(t, "thermal zone 0 (may be motherboard)"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_millideg(path: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let millideg: i64 = text.trim().parse().ok()?;
+    Some(millideg as f64 / 1000.0)
+}
+
+/// temp1_input (edge) of the GPU at `device` (e.g. /sys/bus/pci/devices/0000:03:00.0)
+#[cfg(target_os = "linux")]
+fn read_hwmon_temp(device: &std::path::Path) -> Option<f64> {
+    let entries = std::fs::read_dir(device.join("hwmon")).ok()?;
+    for hwmon in entries.flatten() {
+        if let Some(t) = read_millideg(&hwmon.path().join("temp1_input").to_string_lossy()) {
+            return Some(t);
+        }
+    }
     None
 }
 
-/// Read GPU temperature on macOS via powermetrics
-#[cfg(target_os = "macos")]
-fn read_gpu_temp_macos() -> Option<f64> {
-    use std::process::Command;
+/// First GPU hwmon temperature under /sys/class/drm (single-GPU systems).
+#[cfg(target_os = "linux")]
+fn read_gpu_temp_drm_any() -> Option<f64> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        if let Some(t) = read_hwmon_temp(&entry.path().join("device")) {
+            return Some(t);
+        }
+    }
+    None
+}
 
-    let output = Command::new("sudo")
+// ─── macOS ──────────────────────────────────────────────────────────
+
+/// powermetrics needs root; `sudo -n` fails fast instead of prompting.
+#[cfg(target_os = "macos")]
+fn powermetrics_value(needles: &[&str]) -> Option<f64> {
+    let output = std::process::Command::new("sudo")
         .args(["-n", "powermetrics", "-n", "1", "-i", "1000", "--samplers", "smc"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-
     if !output.status.success() {
         return None;
     }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let lower = line.to_lowercase();
-        if lower.contains("gpu die temperature") || lower.contains("gpu thermal level") {
+        if needles.iter().any(|n| lower.contains(n)) {
             for word in line.split_whitespace() {
                 if let Ok(temp) = word.parse::<f64>() {
                     if temp > 0.0 && temp < 150.0 {
@@ -531,7 +453,35 @@ fn read_gpu_temp_macos() -> Option<f64> {
             }
         }
     }
+    None
+}
 
+#[cfg(target_os = "macos")]
+fn read_cpu_temp_powermetrics() -> Option<f64> {
+    powermetrics_value(&["cpu die temperature", "cpu thermal level"])
+}
+
+#[cfg(target_os = "macos")]
+fn read_gpu_temp_powermetrics() -> Option<f64> {
+    powermetrics_value(&["gpu die temperature", "gpu thermal level"])
+}
+
+/// Some macOS versions expose a CPU temperature via sysctl.
+#[cfg(target_os = "macos")]
+fn read_cpu_temp_sysctl() -> Option<f64> {
+    let output = std::process::Command::new("sysctl").arg("-a").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("temperature") && line.contains("CPU") {
+            for word in line.split_whitespace() {
+                if let Ok(temp) = word.parse::<f64>() {
+                    if temp > 0.0 && temp < 150.0 {
+                        return Some(temp);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 

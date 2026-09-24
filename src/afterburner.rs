@@ -17,6 +17,10 @@
 //!   dwNumGpuEntries   u32
 //!   dwGpuEntrySize    u32
 //!
+//! GPU entries follow the sensor entries (one per GPU, dwGpuEntrySize each):
+//!   szGpuId[260], szFamily[260], szDevice[260], szDriver[260], szBIOS[260],
+//!   dwMemAmount — `dwGpu` in a sensor entry indexes this table.
+//!
 //! Entry (1324 bytes):
 //!   szSrcName[260]          (ASCII, e.g. "CPU1 temperature", "GPU1 temperature")
 //!   szSrcUnits[260]
@@ -59,6 +63,7 @@ pub struct AfterburnerReading {
     pub gpu_temp: Option<f64>,
     pub cpu_source: Option<String>,
     pub gpu_source: Option<String>,
+    pub gpu_usage: Option<f64>,
 }
 
 /// Quick check: is MSI Afterburner's shared memory available?
@@ -73,8 +78,14 @@ pub fn is_available() -> bool {
 
 /// Read CPU/GPU temperatures from MSI Afterburner shared memory.
 pub fn read_temps() -> Option<AfterburnerReading> {
+    read_filtered(&|_| true)
+}
+
+/// Like `read_temps`, but GPU readings only come from GPUs whose device name
+/// passes `gpu_filter` (used to pick one GPU of several).
+pub fn read_filtered(gpu_filter: &dyn Fn(&str) -> bool) -> Option<AfterburnerReading> {
     for name in candidate_names() {
-        if let Some(reading) = try_read(name) {
+        if let Some(reading) = try_read(name, gpu_filter) {
             return Some(reading);
         }
     }
@@ -123,12 +134,12 @@ fn open_mapping(name: &str) -> Option<MappedView> {
     Some(MappedView { handle, view })
 }
 
-fn try_read(name: &str) -> Option<AfterburnerReading> {
+fn try_read(name: &str, gpu_filter: &dyn Fn(&str) -> bool) -> Option<AfterburnerReading> {
     let mapping = open_mapping(name)?;
     // SAFETY: `mapping.view` points to a valid MAHM shared mapping. We
     // validate the signature and bound every entry read against the header
     // size/count values before dereferencing. Region released on drop.
-    unsafe { parse(mapping.view as *const u8) }
+    unsafe { parse(mapping.view as *const u8, gpu_filter) }
 }
 
 fn read_u32(bytes: &[u8], pos: usize) -> Option<u32> {
@@ -147,7 +158,7 @@ fn read_cstr(bytes: &[u8]) -> String {
 }
 
 /// SAFETY: caller guarantees `base` points to a valid MAHM shared mapping.
-unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
+unsafe fn parse(base: *const u8, gpu_filter: &dyn Fn(&str) -> bool) -> Option<AfterburnerReading> {
     // Read the 32-byte header.
     let header = std::slice::from_raw_parts(base, 32);
 
@@ -173,6 +184,20 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
         return None;
     }
 
+    // GPU table: device names indexed by each entry's dwGpu.
+    let num_gpus = read_u32(header, 24)? as usize;
+    let gpu_entry_size = read_u32(header, 28)? as usize;
+    let mut gpu_names: Vec<String> = Vec::new();
+    if num_gpus > 0 && num_gpus <= 16 && (1300..=4096).contains(&gpu_entry_size) {
+        let table = header_size + num_entries * entry_size;
+        for g in 0..num_gpus {
+            let elem = std::slice::from_raw_parts(base.add(table + g * gpu_entry_size), gpu_entry_size);
+            // szDevice at 520, falling back to szFamily at 260
+            let device = read_cstr(&elem[520..780]);
+            gpu_names.push(if device.is_empty() { read_cstr(&elem[260..520]) } else { device });
+        }
+    }
+
     // Entry field offsets (within one entry):
     const OFF_SRC_NAME: usize = 0;
     const NAME_LEN: usize = 260;
@@ -180,6 +205,7 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
     const UNITS_LEN: usize = 260;
     const OFF_DATA: usize = 1300; // after five 260-byte strings
     const OFF_FLAGS: usize = 1312; // data + min + max = 12 bytes after
+    const OFF_GPU: usize = 1316;
     // MSI Afterburner marks unavailable sensors via dwFlags:
     //   0x00000001 = MONITORING_SOURCE_FLAG_ACTIVE
     // Sensors whose hardware doesn't support them have the flag cleared and
@@ -189,6 +215,7 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
 
     let mut cpu_best: Option<(i32, f64, String)> = None;
     let mut gpu_best: Option<(i32, f64, String)> = None;
+    let mut usage_best: Option<(i32, f64)> = None;
 
     for i in 0..num_entries {
         let elem_offset = header_size + i * entry_size;
@@ -203,7 +230,8 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
         let is_celsius = units_bytes == b"\xc2\xb0C"
             || units_bytes == b"C"
             || units.contains("°C");
-        if !is_celsius {
+        let is_percent = units.trim() == "%";
+        if !is_celsius && !is_percent {
             continue;
         }
 
@@ -217,6 +245,21 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
             continue;
         }
         let value = raw as f64;
+
+        let gpu_index = read_u32(elem, OFF_GPU).unwrap_or(u32::MAX) as usize;
+        let gpu_name = gpu_names.get(gpu_index).map(|s| s.as_str()).unwrap_or("");
+        let gpu_ok = gpu_filter(gpu_name);
+
+        if is_percent {
+            let n = name.to_ascii_lowercase();
+            if gpu_ok && n.starts_with("gpu") && n.contains("usage") && (0.0..=100.0).contains(&value) {
+                let score = if n == "gpu usage" || n.starts_with("gpu1 usage") { 100 } else { 50 };
+                if usage_best.map_or(true, |(s, _)| score > s) {
+                    usage_best = Some((score, value));
+                }
+            }
+            continue;
+        }
         if !(value > 0.0 && value < 150.0) {
             continue;
         }
@@ -225,6 +268,9 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
             if cpu_best.as_ref().map_or(true, |(s, _, _)| score > *s) {
                 cpu_best = Some((score, value, name.clone()));
             }
+        }
+        if !gpu_ok {
+            continue;
         }
         if let Some(score) = score_gpu(&name) {
             if gpu_best.as_ref().map_or(true, |(s, _, _)| score > *s) {
@@ -241,6 +287,7 @@ unsafe fn parse(base: *const u8) -> Option<AfterburnerReading> {
         gpu_temp: gpu_best.as_ref().map(|(_, t, _)| *t),
         cpu_source: cpu_best.map(|(_, _, n)| format!("MSI Afterburner / {}", n)),
         gpu_source: gpu_best.map(|(_, _, n)| format!("MSI Afterburner / {}", n)),
+        gpu_usage: usage_best.map(|(_, v)| v),
     })
 }
 
