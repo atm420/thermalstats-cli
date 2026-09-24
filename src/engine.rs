@@ -198,6 +198,14 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+impl Session {
+    /// A session frozen at `progress`, with no controller thread (screenshots).
+    pub fn fixed(plan: TestPlan, progress: Progress) -> Session {
+        Session { plan, progress: Arc::new(Mutex::new(progress)), stop: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
 fn median(mut values: Vec<f64>) -> Option<f64> {
     if values.is_empty() {
         return None;

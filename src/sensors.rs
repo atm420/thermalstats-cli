@@ -209,6 +209,20 @@ impl SensorHub {
     }
 }
 
+#[cfg(test)]
+impl SensorHub {
+    /// Replace the readings with a synthetic history (screenshots and tests).
+    pub fn inject(&self, cpu: Vec<Sample>, gpu: Vec<Sample>, cpu_source: &str, gpu_source: &str) {
+        let mut guard = self.readings.lock().unwrap_or_else(|e| e.into_inner());
+        let r = &mut *guard;
+        for (channel, samples, source) in [(&mut r.cpu_temp, cpu, cpu_source), (&mut r.gpu_temp, gpu, gpu_source)] {
+            channel.samples = samples.into();
+            channel.source = Some(source.to_string());
+            channel.probe = Probe::Found;
+        }
+    }
+}
+
 impl Drop for SensorHub {
     fn drop(&mut self) {
         self.stop();

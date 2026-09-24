@@ -1873,6 +1873,97 @@ mod tests {
         }
     }
 
+    /// Dump the running dashboard (sample data) as JSON cells for the website
+    /// screenshot: SCREENSHOT_OUT=/path.json cargo test screenshot_dump -- --ignored
+    #[test]
+    #[ignore]
+    fn screenshot_dump() {
+        use crate::engine::{Phase, Progress};
+        use crate::sensors::Sample;
+        use crate::stress::{GpuStress, StressStatus};
+        use std::time::Instant;
+
+        let mut a = app("en");
+        a.opts.demo = false;
+        let hub = a.hub.clone().unwrap();
+        hub.stop();
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let now = Instant::now();
+        let elapsed = 74u64;
+        let started = now - Duration::from_secs(elapsed);
+        let mut seed = 7u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 800) as f64 / 1000.0 - 0.4
+        };
+        let mut series = |idle: f64, load: f64, tau: f64| -> Vec<Sample> {
+            (0..=elapsed + 8)
+                .map(|i| {
+                    let t = i as f64 - 8.0;
+                    let v = if t < 0.0 { idle } else { idle + (load - idle) * (1.0 - (-t / tau).exp()) };
+                    Sample { at: started - Duration::from_secs(8) + Duration::from_secs(i), value: ((v + noise()) * 10.0).round() / 10.0 }
+                })
+                .collect()
+        };
+        let cpu = series(41.2, 82.4, 9.0);
+        let gpu = series(34.0, 68.3, 16.0);
+        let part = |s: &[Sample], idle: f64, usage: f64| {
+            let during: Vec<f64> = s.iter().filter(|x| x.at >= started).map(|x| x.value).collect();
+            crate::engine::Part {
+                idle: Some(idle),
+                current: s.last().map(|x| x.value),
+                peak: during.iter().copied().reduce(f64::max),
+                low: during.iter().copied().reduce(f64::min),
+                usage_now: Some(usage),
+                usage_max: Some(usage),
+            }
+        };
+        let progress = Progress {
+            phase: Phase::Running,
+            started: Some(started),
+            ends: Some(started + Duration::from_secs(120)),
+            ends_wall: chrono::Local::now().checked_add_signed(chrono::Duration::seconds(46)),
+            stopped: None,
+            cpu: part(&cpu, 41.2, 100.0),
+            gpu: part(&gpu, 34.0, 99.0),
+            stress: StressStatus {
+                cpu_threads: 16,
+                gpu: GpuStress::Running { adapter: "NVIDIA GeForce RTX 4080 SUPER".into(), backend: "Vulkan".into() },
+            },
+            warnings: Vec::new(),
+            stopped_early: false,
+        };
+        hub.inject(cpu, gpu, "HWiNFO / CPU (Tctl/Tdie)", "NVIDIA driver (NVML) / GPU Core");
+        let plan = TestPlan { kind: crate::engine::TestKind::Both, duration: Duration::from_secs(120), gpu: a.selected_gpu().cloned() };
+        a.session = Some(Session::fixed(plan, progress));
+        a.screen = Screen::Running;
+        a.frame = 4;
+
+        let (w, h) = (120u16, 30u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<Vec<serde_json::Value>> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        let c = &buffer[(x, y)];
+                        serde_json::json!({
+                            "s": c.symbol(),
+                            "fg": format!("{:?}", c.fg),
+                            "bg": format!("{:?}", c.bg),
+                            "bold": c.modifier.contains(Modifier::BOLD),
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let out = std::env::var("SCREENSHOT_OUT").unwrap_or_else(|_| "screenshot.json".into());
+        std::fs::write(out, serde_json::to_string(&rows).unwrap()).unwrap();
+        println!("{}", render(&mut a, w, h).join("\n"));
+    }
+
     /// Print a screen for eyeballing: cargo test preview -- --nocapture --ignored
     #[test]
     #[ignore]

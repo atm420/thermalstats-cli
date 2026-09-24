@@ -4,7 +4,7 @@ A cross-platform tool that stress tests your CPU and GPU, reads real hardware te
 
 **Open source so you can see exactly what runs on your machine.**
 
-> **Version 2 (beta)** replaces the step-by-step prompts with a full-screen interface: a live temperature check before you start, a dashboard with a timer, charts and peak temperatures while the test runs, and a results screen that shows how your hardware compares. Everything below applies to v2; v1 stays available from the [Releases page](https://github.com/atm420/thermalstats-cli/releases).
+> **ThermalStats 2** replaces the step-by-step prompts with a full-screen interface: a live temperature check before you start, a dashboard with a timer, charts and peak temperatures while the test runs, and a results screen that shows how your hardware compares. Need the previous version? [v1.2.6](https://github.com/atm420/thermalstats-cli/releases/tag/v1.2.6) is still available.
 
 ## Download
 

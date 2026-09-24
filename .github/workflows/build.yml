@@ -33,6 +33,12 @@ permissions:
   contents: write
   id-token: write   # Required for Azure OIDC authentication
 
+# Pushing main and a release tag together starts two runs that deploy the
+# same files; run them one after the other instead of side by side.
+concurrency:
+  group: build-and-deploy
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
