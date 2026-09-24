@@ -19,6 +19,26 @@ const SENSOR_LAG: Duration = Duration::from_millis(1500);
 const IDLE_WINDOW: Duration = Duration::from_secs(10);
 /// Checks for a sensor that doesn't react to load wait this long.
 const FLAT_CHECK_AFTER: Duration = Duration::from_secs(30);
+/// Idle temperatures above these suggest background load or a system that
+/// hasn't cooled down yet — the test should start from idle.
+pub const IDLE_WARM: f64 = 56.0;
+pub const IDLE_HOT: f64 = 65.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleLevel {
+    Warm,
+    Hot,
+}
+
+pub fn idle_level(celsius: f64) -> Option<IdleLevel> {
+    if celsius > IDLE_HOT {
+        Some(IdleLevel::Hot)
+    } else if celsius > IDLE_WARM {
+        Some(IdleLevel::Warm)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestKind {
@@ -82,6 +102,11 @@ pub enum Warning {
     /// The CPU got hot enough that it is probably throttling.
     CpuVeryHot(f64),
     GpuVeryHot(f64),
+    /// Already warm/hot before the stress started (idle temperature).
+    CpuIdleWarm(f64),
+    CpuIdleHot(f64),
+    GpuIdleWarm(f64),
+    GpuIdleHot(f64),
 }
 
 /// Temperatures and load for one component (CPU or GPU).
@@ -252,6 +277,20 @@ fn run(plan: &TestPlan, hub: &SensorHub, progress: &Mutex<Progress>, stop: &Atom
         if plan.kind.gpu() && gpu_idle.is_none() {
             p.warnings.push(Warning::GpuSensorMissing);
         }
+        if plan.kind.cpu() {
+            match cpu_idle.and_then(|t| idle_level(t).map(|l| (l, t))) {
+                Some((IdleLevel::Hot, t)) => p.warnings.push(Warning::CpuIdleHot(t)),
+                Some((IdleLevel::Warm, t)) => p.warnings.push(Warning::CpuIdleWarm(t)),
+                None => {}
+            }
+        }
+        if plan.kind.gpu() {
+            match gpu_idle.and_then(|t| idle_level(t).map(|l| (l, t))) {
+                Some((IdleLevel::Hot, t)) => p.warnings.push(Warning::GpuIdleHot(t)),
+                Some((IdleLevel::Warm, t)) => p.warnings.push(Warning::GpuIdleWarm(t)),
+                None => {}
+            }
+        }
     }
 
     if stop.load(Ordering::SeqCst) {
@@ -417,6 +456,14 @@ mod tests {
         assert!(!p.is_valid());
         p.peak = Some(130.0); // above the API maximum
         assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn idle_thresholds() {
+        assert_eq!(idle_level(56.0), None);
+        assert_eq!(idle_level(56.5), Some(IdleLevel::Warm));
+        assert_eq!(idle_level(65.0), Some(IdleLevel::Warm));
+        assert_eq!(idle_level(65.1), Some(IdleLevel::Hot));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! colours for the same reason.
 
 use crate::app::*;
-use crate::engine::{Part, Phase, TestKind, Warning};
+use crate::engine::{IdleLevel, Part, Phase, TestKind, Warning};
 use crate::lang::{fill, LANGUAGES};
 use crate::sensors::{Channel, Probe};
 use crate::setup::DriverState;
@@ -32,6 +32,9 @@ const DIM: Color = Color::DarkGray;
 const OK: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
+/// Light panel for keys, idle fields and chips. Black text on it reads well
+/// in every Windows console scheme; white on dark grey did not.
+const PANEL: Color = Color::Gray;
 
 type Hits = Vec<(Rect, Action)>;
 
@@ -226,6 +229,8 @@ fn draw_buttons(f: &mut Frame, ctx: &mut Ctx, area: Rect, y: u16, buttons: &[Btn
         if row_y >= area.bottom() {
             break;
         }
+        // Primary: one solid accent block. Secondary: key chip plus plain
+        // label, the same style as the footer.
         let (key_style, label_style) = if b.primary {
             (
                 Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
@@ -233,8 +238,8 @@ fn draw_buttons(f: &mut Frame, ctx: &mut Ctx, area: Rect, y: u16, buttons: &[Btn
             )
         } else {
             (
-                Style::new().fg(Color::White).bg(DIM).add_modifier(Modifier::BOLD),
-                Style::new().fg(Color::White).bg(DIM),
+                Style::new().fg(Color::Black).bg(PANEL).add_modifier(Modifier::BOLD),
+                Style::new().add_modifier(Modifier::BOLD),
             )
         };
         let rect = Rect::new(x, row_y, w.min(area.right() - x), 1);
@@ -282,7 +287,7 @@ fn draw_header(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     let lang = format!(" {} ", ctx.app.locale.to_uppercase());
     let lang_w = width_of(&lang);
     let lang_rect = Rect::new(top.right().saturating_sub(lang_w), top.y, lang_w, 1);
-    f.render_widget(Span::styled(lang, Style::new().fg(Color::Black).bg(MUTED)), lang_rect);
+    f.render_widget(Span::styled(lang, Style::new().fg(Color::Black).bg(PANEL)), lang_rect);
     ctx.hit(lang_rect, Action::Language);
 
     // Step indicator, right-aligned before the language badge
@@ -354,7 +359,7 @@ fn draw_footer(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         };
         f.render_widget(
             Line::from(vec![
-                Span::styled(format!(" {} ", key), Style::new().fg(Color::Black).bg(MUTED)),
+                Span::styled(format!(" {} ", key), Style::new().fg(Color::Black).bg(PANEL)),
                 Span::styled(format!(" {}", label), label_style),
             ]),
             rect,
@@ -503,6 +508,13 @@ fn draw_home(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     para(f, area, &mut y, Line::from(vec![Span::styled(format!("{} ", mark), style), Span::styled(text, style)]), 2);
 
     if !searching {
+        // Starting warm skews the idle reading: say so before they start.
+        let current = [(t.label_cpu, cpu.latest()), (t.label_gpu, if has_gpu { gpu.latest() } else { None })];
+        for (part, sample) in current {
+            if let Some((note, color)) = sample.and_then(|s| idle_note(app, part, s.value)) {
+                para(f, area, &mut y, Line::from(vec![Span::styled("▲ ", Style::new().fg(color)), Span::styled(note, Style::new().fg(color))]), 2);
+            }
+        }
         for tip in sensor_tips(app, &cpu, &gpu, has_gpu, cpu_board) {
             para(f, area, &mut y, Line::from(vec![Span::styled("• ", Style::new().fg(WARN)), Span::raw(tip)]), 4);
         }
@@ -718,7 +730,6 @@ fn chips_row(f: &mut Frame, ctx: &mut Ctx, area: Rect, chips: &[String], selecte
 
 /// One-line text box. Places the terminal cursor when focused.
 fn text_field(f: &mut Frame, ctx: &mut Ctx, rect: Rect, input: &TextInput, placeholder: &str, focused: bool, field: Field) -> u16 {
-    let bg = if focused { Color::Blue } else { DIM };
     let inner_w = rect.width.saturating_sub(2) as usize;
     let chars: Vec<char> = input.value.chars().collect();
     // Scroll so the cursor stays visible.
@@ -728,13 +739,12 @@ fn text_field(f: &mut Frame, ctx: &mut Ctx, rect: Rect, input: &TextInput, place
     }
     let visible: String = chars[start..].iter().collect();
     let visible = truncate(&visible, inner_w);
-    let (text, style) = if input.value.is_empty() && !focused {
-        (truncate(placeholder, inner_w), Style::new().fg(MUTED).bg(bg))
-    } else if input.value.is_empty() {
-        (truncate(placeholder, inner_w), Style::new().fg(Color::Gray).bg(bg))
+    let style = if focused {
+        Style::new().fg(Color::White).bg(Color::Blue)
     } else {
-        (visible, Style::new().fg(Color::White).bg(bg))
+        Style::new().fg(Color::Black).bg(PANEL)
     };
+    let text = if input.value.is_empty() { truncate(placeholder, inner_w) } else { visible };
     let padded = format!(" {} ", pad(&text, inner_w));
     f.render_widget(Span::styled(padded, style), rect);
     ctx.hit(rect, Action::Focus(field));
@@ -794,8 +804,20 @@ fn draw_confirm(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         (t.hu_close.to_string(), Color::Reset),
         (t.hu_stop.to_string(), Color::Reset),
     ];
+    if app.submits() {
+        bullets.push((format!("{} {}", t.hu_auto_submit, t.submit_what), Color::Reset));
+    }
     if app.on_battery == Some(true) {
         bullets.push((t.hu_battery.to_string(), WARN));
+    }
+    if let Some(hub) = &app.hub {
+        let (cpu_now, gpu_now) = hub.with(|r| (r.cpu_temp.latest(), r.gpu_temp.latest()));
+        if let Some(note) = cpu_now.filter(|_| kind.cpu()).and_then(|s| idle_note(app, t.label_cpu, s.value)) {
+            bullets.push(note);
+        }
+        if let Some(note) = gpu_now.filter(|_| kind.gpu()).and_then(|s| idle_note(app, t.label_gpu, s.value)) {
+            bullets.push(note);
+        }
     }
     if let Some(hub) = &app.hub {
         let (cpu_missing, gpu_missing) = hub.with(|r| (r.cpu_temp.probe == Probe::Missing, r.gpu_temp.probe == Probe::Missing));
@@ -888,10 +910,10 @@ fn draw_running(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     y += 1;
 
     // Warnings and the notice go at the bottom; cards take the rest.
-    let warnings: Vec<String> = p.warnings.iter().map(|w| warning_text(app, w)).collect();
+    let warnings: Vec<(String, Color)> = p.warnings.iter().map(|w| (warning_text(app, w), warning_color(w))).collect();
     let notice_w = area.width.saturating_sub(4);
     let notice_h = wrapped_height(&Line::from(t.running_notice), notice_w);
-    let warn_h: u16 = warnings.iter().map(|w| wrapped_height(&Line::from(w.as_str()), notice_w)).sum::<u16>().min(4);
+    let warn_h: u16 = warnings.iter().map(|(w, _)| wrapped_height(&Line::from(w.as_str()), notice_w)).sum::<u16>().min(4);
     let bottom_h = notice_h + warn_h + 1;
     let cards_h = area.bottom().saturating_sub(y + bottom_h);
     let cards = Rect::new(area.x, y, area.width, cards_h);
@@ -969,8 +991,8 @@ fn draw_running(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     // Bottom: warnings, then the reassurance notice.
     let mut by = area.bottom().saturating_sub(bottom_h) + 1;
     let bottom = Rect::new(area.x, by, area.width, bottom_h);
-    for w in warnings.iter().take(3) {
-        para(f, bottom, &mut by, Line::from(vec![Span::styled("▲ ", Style::new().fg(WARN)), Span::styled(w.clone(), Style::new().fg(WARN))]), 0);
+    for (w, color) in warnings.iter().take(3) {
+        para(f, bottom, &mut by, Line::from(vec![Span::styled("▲ ", Style::new().fg(*color)), Span::styled(w.clone(), Style::new().fg(*color))]), 0);
     }
     para(
         f,
@@ -1187,6 +1209,27 @@ fn warning_text(app: &App, w: &Warning) -> String {
         Warning::GpuStressFailed(reason) => fill(t.warn_gpu_failed, &[("reason", reason)]),
         Warning::CpuSensorMissing => t.warn_cpu_missing.to_string(),
         Warning::GpuSensorMissing => t.warn_gpu_missing.to_string(),
+        Warning::CpuIdleWarm(v) => fill(t.warn_idle_warm, &[("part", t.label_cpu), ("temp", &fmt_temp(*v))]),
+        Warning::CpuIdleHot(v) => fill(t.warn_idle_hot, &[("part", t.label_cpu), ("temp", &fmt_temp(*v))]),
+        Warning::GpuIdleWarm(v) => fill(t.warn_idle_warm, &[("part", t.label_gpu), ("temp", &fmt_temp(*v))]),
+        Warning::GpuIdleHot(v) => fill(t.warn_idle_hot, &[("part", t.label_gpu), ("temp", &fmt_temp(*v))]),
+    }
+}
+
+fn warning_color(w: &Warning) -> Color {
+    match w {
+        Warning::CpuIdleHot(_) | Warning::GpuIdleHot(_) => BAD,
+        _ => WARN,
+    }
+}
+
+/// Warm/hot note for a temperature read before the test starts.
+fn idle_note(app: &App, part: &str, celsius: f64) -> Option<(String, Color)> {
+    let t = &app.t;
+    let values = [("part", part), ("temp", &fmt_temp(celsius) as &str)];
+    match crate::engine::idle_level(celsius)? {
+        IdleLevel::Warm => Some((fill(t.warn_idle_warm, &values), WARN)),
+        IdleLevel::Hot => Some((fill(t.warn_idle_hot, &values), BAD)),
     }
 }
 
@@ -1272,29 +1315,13 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         row(f, area, &mut y, Line::from(vec![Span::styled("  ● ", Style::new().fg(OK)), Span::raw(t.check_gpu_ok)]));
     }
     for w in &p.warnings {
-        para(f, area, &mut y, Line::from(vec![Span::styled("▲ ", Style::new().fg(WARN)), Span::raw(warning_text(app, w))]), 2);
+        para(f, area, &mut y, Line::from(vec![Span::styled("▲ ", Style::new().fg(warning_color(w))), Span::raw(warning_text(app, w))]), 2);
     }
     y += 1;
 
     // Submission
     let buttons: Vec<Btn> = match &r.submit {
-        SubmitState::Ready => {
-            row(f, area, &mut y, section(t.submit_prompt));
-            para(f, area, &mut y, Line::from(Span::styled(t.submit_what, Style::new().fg(MUTED))), 2);
-            if let Some(left) = r.auto_submit_left {
-                let secs = left.as_secs() + if left.subsec_millis() > 0 { 1 } else { 0 };
-                row(f, area, &mut y, Line::from(Span::styled(
-                    format!("  {}", fill(t.submit_countdown, &[("secs", &secs.to_string())])),
-                    Style::new().fg(ACCENT),
-                )));
-            }
-            vec![
-                btn("Enter", t.btn_submit, Action::Submit, true),
-                btn("E", t.btn_edit, Action::EditDetails, false),
-                btn("N", t.btn_dont_submit, Action::DontSubmit, false),
-            ]
-        }
-        SubmitState::Sending(_) => {
+        SubmitState::Ready | SubmitState::Sending(_) => {
             row(f, area, &mut y, Line::from(vec![
                 Span::styled(format!("{} ", pulse(app.frame)), Style::new().fg(ACCENT)),
                 Span::raw(t.submitting),
@@ -1329,12 +1356,8 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             b.push(btn("Q", t.btn_quit, Action::Quit, false));
             b
         }
-        SubmitState::Skipped | SubmitState::Blocked(_) => {
-            let text = match &r.submit {
-                SubmitState::Blocked(reason) => reason.clone(),
-                _ => t.skipped_submit.to_string(),
-            };
-            para(f, area, &mut y, Line::from(Span::styled(text, Style::new().fg(MUTED))), 0);
+        SubmitState::Blocked(reason) => {
+            para(f, area, &mut y, Line::from(Span::styled(reason.clone(), Style::new().fg(MUTED))), 0);
             vec![btn("Enter", t.btn_again, Action::RunAgain, true), btn("Q", t.btn_quit, Action::Quit, false)]
         }
     };
@@ -1633,7 +1656,7 @@ fn draw_feedback(f: &mut Frame, ctx: &mut Ctx, area: Rect, width: u16, fb: &Feed
     let mut x = inner.x + 2;
     for n in 1..=5u8 {
         let on = fb.rating.is_some_and(|r| n <= r);
-        let style = if on { Style::new().fg(Color::Black).bg(WARN).add_modifier(Modifier::BOLD) } else { Style::new().fg(Color::White).bg(DIM) };
+        let style = if on { Style::new().fg(Color::Black).bg(WARN).add_modifier(Modifier::BOLD) } else { Style::new().fg(Color::Black).bg(PANEL) };
         let rect = Rect::new(x, y, 3, 1);
         f.render_widget(Span::styled(format!(" {} ", n), style), rect);
         ctx.hit(rect, Action::FbRating(n));
@@ -1666,15 +1689,19 @@ fn draw_feedback(f: &mut Frame, ctx: &mut Ctx, area: Rect, width: u16, fb: &Feed
     y += 1;
     let msg_h = 4u16;
     let msg_rect = Rect::new(inner.x + 2, y, inner.width.saturating_sub(2), msg_h);
-    let bg = if fb.focus == FbField::Message { Color::Blue } else { DIM };
-    let (text, style) = if fb.message.value.is_empty() {
-        (t.fb_message_ph.to_string(), Style::new().fg(Color::Gray).bg(bg))
+    let style = if fb.focus == FbField::Message {
+        Style::new().fg(Color::White).bg(Color::Blue)
+    } else {
+        Style::new().fg(Color::Black).bg(PANEL)
+    };
+    let text = if fb.message.value.is_empty() {
+        t.fb_message_ph.to_string()
     } else {
         let mut v = fb.message.value.clone();
         if fb.focus == FbField::Message {
             v.push('▌');
         }
-        (v, Style::new().fg(Color::White).bg(bg))
+        v
     };
     f.render_widget(Paragraph::new(text).style(style).wrap(Wrap { trim: false }), msg_rect);
     ctx.hit(msg_rect, Action::FbFocus(FbField::Message));
@@ -1821,6 +1848,27 @@ mod tests {
                 if let Some(s) = &a.session {
                     s.request_stop();
                 }
+            }
+        }
+    }
+
+    /// Secondary buttons and fields must never be light text on dark grey
+    /// (unreadable in the Windows console).
+    #[test]
+    fn no_light_text_on_dark_grey() {
+        let mut a = app("en");
+        for screen in [Screen::Home, Screen::Options, Screen::Confirm] {
+            a.screen = screen;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| draw(f, &mut a)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for cell in buffer.content() {
+                assert_ne!(cell.bg, DIM, "dark grey background on {:?} ({:?})", screen, cell.symbol());
+            }
+            if screen == Screen::Home {
+                // The "D" key chip of the Diagnostics button: black on the light panel.
+                let d = buffer.content().iter().find(|c| c.symbol() == "D" && c.bg == PANEL);
+                assert!(d.is_some_and(|c| c.fg == Color::Black), "Diagnostics key chip not black on light grey");
             }
         }
     }

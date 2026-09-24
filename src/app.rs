@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const AUTO_SUBMIT_AFTER: Duration = Duration::from_secs(15);
 const TOAST_FOR: Duration = Duration::from_secs(5);
 
 pub const DURATIONS: [u64; 4] = [60, 120, 180, 300];
@@ -332,12 +331,11 @@ pub struct FeedbackForm {
 // ─── Results ───────────────────────────────────────────────────────
 
 pub enum SubmitState {
-    /// Waiting for the user (or the countdown).
+    /// About to be sent (a completed test submits straight away).
     Ready,
     Sending(Task<Result<String, ApiError>>),
     Done { url: String },
     Failed { reason: String, retry: bool },
-    Skipped,
     /// Can't be submitted; the reason is shown.
     Blocked(String),
 }
@@ -354,8 +352,6 @@ pub struct ResultsState {
     pub progress: Progress,
     pub verdict: Verdict,
     pub submit: SubmitState,
-    /// Countdown to the automatic submission; paused while a dialog is open.
-    pub auto_submit_left: Option<Duration>,
     pub compare: CompareState,
 }
 
@@ -411,7 +407,6 @@ pub enum Action {
     KeepRunning,
     ConfirmStop,
     Submit,
-    DontSubmit,
     EditDetails,
     SaveDetails,
     OpenResults,
@@ -469,7 +464,6 @@ pub struct App {
     pub quit: bool,
     /// Shown in the terminal after the interface closes.
     pub farewell_url: Option<String>,
-    last_tick: Instant,
     pawnio_decided: bool,
 }
 
@@ -508,7 +502,6 @@ impl App {
             frame: 0,
             quit: false,
             farewell_url: None,
-            last_tick: Instant::now(),
             pawnio_decided: false,
         }
     }
@@ -576,8 +569,6 @@ impl App {
 
     pub fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        let dt = self.last_tick.elapsed();
-        self.last_tick = Instant::now();
 
         if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST_FOR) {
             self.toast = None;
@@ -606,7 +597,7 @@ impl App {
             }
         }
 
-        self.tick_results(dt);
+        self.tick_results();
         self.tick_feedback();
         self.tick_diagnostics();
         self.tick_pawnio();
@@ -656,8 +647,7 @@ impl App {
         }
     }
 
-    fn tick_results(&mut self, dt: Duration) {
-        let modal_open = self.modal.is_some();
+    fn tick_results(&mut self) {
         let Some(r) = &mut self.results else { return };
 
         if let SubmitState::Sending(task) = &r.submit {
@@ -689,16 +679,6 @@ impl App {
                     Ok(c) => CompareState::Ready(c),
                     Err(_) => CompareState::Failed,
                 };
-            }
-        }
-
-        if matches!(r.submit, SubmitState::Ready) && !modal_open {
-            if let Some(left) = r.auto_submit_left {
-                let left = left.saturating_sub(dt);
-                r.auto_submit_left = Some(left);
-                if left.is_zero() {
-                    self.submit();
-                }
             }
         }
     }
@@ -892,10 +872,7 @@ impl App {
                 SubmitState::Done { .. } => Some(Action::OpenResults),
                 _ => Some(Action::RunAgain),
             },
-            KeyCode::Char('e' | 'E') if matches!(r.submit, SubmitState::Ready | SubmitState::Failed { .. }) => {
-                Some(Action::EditDetails)
-            }
-            KeyCode::Char('n' | 'N') if matches!(r.submit, SubmitState::Ready) => Some(Action::DontSubmit),
+            KeyCode::Char('e' | 'E') if matches!(r.submit, SubmitState::Failed { .. }) => Some(Action::EditDetails),
             KeyCode::Char('o' | 'O') if done => Some(Action::OpenResults),
             KeyCode::Char('c' | 'C') if done => Some(Action::CopyLink),
             KeyCode::Char('r' | 'R') => match &r.submit {
@@ -904,8 +881,7 @@ impl App {
                 _ => Some(Action::RunAgain),
             },
             KeyCode::Esc => match &r.submit {
-                SubmitState::Ready => Some(Action::DontSubmit),
-                SubmitState::Sending(_) => None,
+                SubmitState::Ready | SubmitState::Sending(_) => None,
                 _ => Some(Action::RunAgain),
             },
             _ => None,
@@ -1060,17 +1036,7 @@ impl App {
                 }
             }
             Action::Submit => self.submit(),
-            Action::DontSubmit => {
-                if let Some(r) = &mut self.results {
-                    if matches!(r.submit, SubmitState::Ready) {
-                        r.submit = SubmitState::Skipped;
-                    }
-                }
-            }
             Action::EditDetails => {
-                if let Some(r) = &mut self.results {
-                    r.auto_submit_left = None; // they're reviewing; don't rush them
-                }
                 let mut form = self.form.clone();
                 form.focus = form.fields(self.is_laptop(), 0, true)[0];
                 form.error = None;
@@ -1314,9 +1280,15 @@ impl App {
         self.screen = Screen::Running;
     }
 
+    /// Whether a completed test will be submitted. Demo results are
+    /// simulated, so they may only go to a local development server.
+    pub fn submits(&self) -> bool {
+        let local = self.site.contains("://localhost") || self.site.contains("://127.0.0.1");
+        !self.opts.no_submit && (!self.opts.demo || local)
+    }
+
     fn show_results(&mut self, plan: TestPlan, progress: Progress) {
         let verdict = engine::verdict(&plan, &progress);
-        // Demo results are simulated: they may only go to a local dev server.
         let local = self.site.contains("://localhost") || self.site.contains("://127.0.0.1");
         let blocked = if self.opts.demo && !local {
             Some(self.t.reason_demo)
@@ -1329,19 +1301,14 @@ impl App {
         } else {
             None
         };
-        let (submit, auto) = match blocked {
-            Some(reason) => (SubmitState::Blocked(fill(self.t.not_submittable, &[("reason", reason)])), None),
-            None => (SubmitState::Ready, Some(AUTO_SUBMIT_AFTER)),
+        let submit = match blocked {
+            Some(reason) => SubmitState::Blocked(fill(self.t.not_submittable, &[("reason", reason)])),
+            None => SubmitState::Ready,
         };
-        self.results = Some(ResultsState {
-            plan,
-            progress,
-            verdict,
-            submit,
-            auto_submit_left: auto,
-            compare: CompareState::Idle,
-        });
+        self.results = Some(ResultsState { plan, progress, verdict, submit, compare: CompareState::Idle });
         self.screen = Screen::Results;
+        // A completed, valid test is submitted right away.
+        self.submit();
     }
 
     fn payload(&self, r: &ResultsState, kind: TestKind) -> SubmissionPayload {
@@ -1392,9 +1359,7 @@ impl App {
         let task = Task::spawn("submit", Err(ApiError::Connection("unexpected error".into())), move || {
             api::submit_results(&site, &payload)
         });
-        let r = self.results.as_mut().unwrap();
-        r.submit = SubmitState::Sending(task);
-        r.auto_submit_left = None;
+        self.results.as_mut().unwrap().submit = SubmitState::Sending(task);
     }
 
     fn start_compare(&mut self) {
