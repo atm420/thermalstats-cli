@@ -7,9 +7,10 @@
 #   https://thermalstats.com/downloads/beta/<BETA_DOWNLOAD_TOKEN>/
 #
 # That page lists the latest build (version, commit, time) with download
-# links that bypass the Cloudflare cache. Nothing here touches the public
-# binaries in /downloads/ or creates a GitHub Release, so the current CLI
-# stays exactly as it is while v2 is tested.
+# links, served by the site's /downloads/beta/[token] route (Next.js doesn't
+# serve files added to public/ after it starts). Nothing here touches the
+# public binaries in /downloads/ or creates a GitHub Release, so the current
+# CLI stays exactly as it is while v2 is tested.
 #
 # Required secret (in addition to those build.yml uses):
 #   BETA_DOWNLOAD_TOKEN — long random string used as the private folder name,
@@ -223,8 +224,10 @@ jobs:
           BUILT=$(date -u '+%Y-%m-%d %H:%M UTC')
           SUBJECT=$(git log -1 --format=%s | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
 
-          # Cloudflare caches .exe files for hours but not HTML, so this page is
-          # always current and its ?b= links skip any stale cached binary.
+          # The site redirects away the folder URL's trailing slash, so links must
+          # be absolute. ?b= makes each build's links unique, skipping any stale
+          # copy a cache might still hold.
+          BASE="/downloads/beta/$BETA_DOWNLOAD_TOKEN"
           cat > beta/index.html << HTMLEOF
           <!doctype html>
           <html lang="en">
@@ -244,9 +247,9 @@ jobs:
           <h1>ThermalStats ${VERSION}</h1>
           <p>Build #${RUN_NUMBER} &middot; <code>${COMMIT}</code> &middot; ${BUILT}<br><small>${SUBJECT}</small></p>
           <div class="dl">
-            <a href="thermalstats-beta.exe?b=${RUN_NUMBER}" download>Windows (signed)</a>
-            <a href="thermalstats-beta-linux?b=${RUN_NUMBER}" download>Linux</a>
-            <a href="thermalstats-beta-macos?b=${RUN_NUMBER}" download>macOS (Apple Silicon)</a>
+            <a href="${BASE}/thermalstats-beta.exe?b=${RUN_NUMBER}" download>Windows (signed)</a>
+            <a href="${BASE}/thermalstats-beta-linux?b=${RUN_NUMBER}" download>Linux</a>
+            <a href="${BASE}/thermalstats-beta-macos?b=${RUN_NUMBER}" download>macOS (Apple Silicon)</a>
           </div>
           <p><small>Private test build &mdash; please don't share this page.</small></p>
           </body>
