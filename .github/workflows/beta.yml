@@ -80,10 +80,13 @@ jobs:
           Expand-Archive -Path lhm/lhm-bundle.zip -DestinationPath $work -Force
           $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
           if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          # Absolute backslash path: the old csc misreads "lhm/ThermalReader.cs"
+          # (it looked for ThermalReader.cs in the repo root).
+          $source = (Resolve-Path 'lhm\ThermalReader.cs').Path
           & $csc /nologo /optimize+ /target:exe /platform:anycpu `
             "/out:$work\ThermalReader.exe" `
             "/reference:$work\LibreHardwareMonitorLib.dll" `
-            lhm/ThermalReader.cs
+            "$source"
           if ($LASTEXITCODE -ne 0) { throw "csc failed with exit code $LASTEXITCODE" }
           Remove-Item lhm/lhm-bundle.zip
           Compress-Archive -Path "$work\*" -DestinationPath lhm/lhm-bundle.zip
