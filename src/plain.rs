@@ -3,7 +3,7 @@
 //! or if the full-screen interface can't start.
 
 use crate::api::{self, SubmissionPayload};
-use crate::app::{machine_id, LaunchOptions, VERSION};
+use crate::app::{machine_id, App, LaunchOptions, MIN_SUBMIT_SECS, VERSION};
 use crate::engine::{self, Phase, Session, TestKind, TestPlan};
 use crate::sensors::{Probe, SensorHub};
 use colored::Colorize;
@@ -92,6 +92,7 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
     }
     let duration = Duration::from_secs(opts.duration.unwrap_or(120));
     let plan = TestPlan { kind, duration, gpu: if kind.gpu() { gpu.clone() } else { None } };
+    let quick = App::is_quick(duration.as_secs());
 
     println!(
         "\n{} {} stress test for {}s. Your PC may feel slow and fans may get loud; that's normal.",
@@ -99,6 +100,12 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
         kind.as_str().to_uppercase(),
         duration.as_secs()
     );
+    if quick {
+        println!(
+            "  {}",
+            format!("Quick test: only tests of {} seconds or longer are submitted.", MIN_SUBMIT_SECS).yellow()
+        );
+    }
     let session = Session::start(plan.clone(), hub.clone());
     let mut last_print = Instant::now() - Duration::from_secs(60);
     let progress = loop {
@@ -143,6 +150,13 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
     let local = site.contains("://localhost") || site.contains("://127.0.0.1");
     if opts.no_submit || (opts.demo && !local) {
         println!("\n  {}", "Skipping submission.".dimmed());
+        return 0;
+    }
+    if quick {
+        println!(
+            "\n  Not submitted: this was a quick test. Run with --duration {} or longer to submit your result.",
+            MIN_SUBMIT_SECS
+        );
         return 0;
     }
 
@@ -196,6 +210,10 @@ fn run_diagnostics(
     locale: &str,
 ) -> i32 {
     println!("\n{}", "Diagnostics (results are not submitted)".yellow().bold());
+    println!(
+        "  {}",
+        "Only needed if temperatures aren't detected. To test your PC and submit a result, run thermalstats --test both.".dimmed()
+    );
     let mut log: Vec<String> = Vec::new();
     crate::diagnostics::collect(hw, setup, Some(gpu_index), &mut |line| {
         println!("  {}", line);

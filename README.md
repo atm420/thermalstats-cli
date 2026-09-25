@@ -22,7 +22,7 @@ Pre-built binaries are available on the [Releases page](https://github.com/atm42
 2. **Lets you choose the test.** CPU, GPU or both; which GPU to test on multi-GPU systems; duration; cooling details. Your answers are remembered for next time.
 3. **Warns you before loading the system.** Your PC may feel slow, fans get loud and the screen may stutter. That's expected, and you can stop at any time.
 4. **Runs the stress test.** A progress bar driven by the clock (it never stalls), the finish time, live and peak temperatures with charts, and warnings if something looks wrong (a sensor that doesn't react to load, a GPU that isn't busy, thermal throttling).
-5. **Shows results and submits them.** Idle, peak, rise and maximum load for each part. A completed test is submitted automatically (use `--no-submit` to skip this), your results page opens in the browser, and you see how you compare with other results for the same hardware. A test stopped early is never submitted.
+5. **Shows results and submits them.** Idle, peak, rise and maximum load for each part. A completed test of 1 minute or longer is submitted automatically (use `--no-submit` to skip this), your results page opens in the browser, and you see how you compare with other results for the same hardware. A test stopped early is never submitted, and neither is a 30-second quick test.
 
 Press **F** at any time to send feedback (bug, idea, praise) straight from the app, or **S** to support ThermalStats.
 
@@ -47,7 +47,8 @@ thermalstats --test cpu --duration 180 --cooling-type aio --cooling-model "NZXT 
 # Plain text output (used automatically when output isn't a terminal)
 thermalstats --plain --test both --duration 120
 
-# Troubleshooting: check every temperature source and upload a diagnostic log
+# Troubleshooting (only if temperatures aren't detected): check every
+# temperature source and upload a diagnostic log
 thermalstats --test debug
 
 # Just detect your hardware (no stress test)
@@ -58,8 +59,8 @@ thermalstats --detect-only
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-t, --test` | Test type: `cpu`, `gpu`, `both`, or `debug` (diagnostics) | `both` |
-| `-d, --duration` | Stress test duration in seconds (30–3600) | `120` |
+| `-t, --test` | Test type: `cpu`, `gpu`, `both`, or `debug` (diagnostics, only needed if temperatures aren't detected) | `both` |
+| `-d, --duration` | Stress test duration in seconds (30–3600). Only tests of 60 seconds or longer are submitted; shorter ones are quick tests | `120` |
 | `--cooling-type` | `stock`, `air`, `aio`, `custom_loop`, `passive`, `other` | — |
 | `--cooling-model` | Cooling model name | — |
 | `--ambient-temp` | Room temperature (°C) | — |

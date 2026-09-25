@@ -40,11 +40,11 @@ use engine::TestKind;
     long_about = "Detects your hardware, runs CPU/GPU stress tests, reads real temperatures\nvia system APIs, and submits results to ThermalStats for community comparison.\n\nRun without options for the interactive interface; options pre-fill it."
 )]
 struct Cli {
-    /// Test type: cpu, gpu, both, or debug (diagnostics)
+    /// Test type: cpu, gpu, both, or debug (diagnostics, only needed if temperatures aren't detected)
     #[arg(short, long)]
     test: Option<String>,
 
-    /// Stress test duration in seconds (30-3600)
+    /// Stress test duration in seconds (30-3600; only tests of 60+ seconds are submitted)
     #[arg(short, long)]
     duration: Option<u64>,
 

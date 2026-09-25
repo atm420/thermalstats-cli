@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TOAST_FOR: Duration = Duration::from_secs(5);
 
-pub const DURATIONS: [u64; 4] = [60, 120, 180, 300];
+pub const DURATIONS: [u64; 5] = [30, 60, 120, 180, 300];
+/// Shorter tests are quick checks: the results are shown but never submitted.
+pub const MIN_SUBMIT_SECS: u64 = 60;
 pub const TEST_KINDS: [TestKind; 3] = [TestKind::Both, TestKind::Cpu, TestKind::Gpu];
 /// API values for the cooling choices, in display order ("" = skip).
 pub const COOLING: [&str; 7] = ["stock", "air", "aio", "custom_loop", "passive", "other", ""];
@@ -1287,6 +1289,11 @@ impl App {
         !self.opts.no_submit && (!self.opts.demo || local)
     }
 
+    /// A test too short to be submitted (see MIN_SUBMIT_SECS).
+    pub fn is_quick(secs: u64) -> bool {
+        secs < MIN_SUBMIT_SECS
+    }
+
     fn show_results(&mut self, plan: TestPlan, progress: Progress) {
         let verdict = engine::verdict(&plan, &progress);
         let local = self.site.contains("://localhost") || self.site.contains("://127.0.0.1");
@@ -1303,6 +1310,8 @@ impl App {
         };
         let submit = match blocked {
             Some(reason) => SubmitState::Blocked(fill(self.t.not_submittable, &[("reason", reason)])),
+            // A quick test is a choice, not a failure: explain instead of apologising.
+            None if Self::is_quick(plan.duration.as_secs()) => SubmitState::Blocked(self.t.quick_not_submitted.to_string()),
             None => SubmitState::Ready,
         };
         self.results = Some(ResultsState { plan, progress, verdict, submit, compare: CompareState::Idle });
@@ -1712,6 +1721,37 @@ mod tests {
         assert_eq!(form.duration_secs(), None);
         form.custom_secs = TextInput::new("90", 4);
         assert_eq!(form.duration_secs(), Some(90));
+    }
+
+    #[test]
+    fn quick_tests_are_not_submitted() {
+        assert_eq!(DURATIONS[0], 30);
+        let mut o = opts();
+        // Demo results may go to a local server; nothing listens on port 9.
+        o.demo = true;
+        o.api_url = "http://127.0.0.1:9/api/submissions".into();
+        let mut app = App::new("en".into(), o);
+        for (secs, submitted) in [(30, false), (59, false), (60, true), (120, true)] {
+            let plan = TestPlan { kind: TestKind::Cpu, duration: Duration::from_secs(secs), gpu: None };
+            let progress = Progress {
+                phase: Phase::Finished,
+                started: None,
+                ends: None,
+                ends_wall: None,
+                stopped: None,
+                cpu: engine::Part { idle: Some(40.0), peak: Some(80.0), ..Default::default() },
+                gpu: engine::Part::default(),
+                stress: crate::stress::StressStatus { cpu_threads: 8, gpu: crate::stress::GpuStress::Off },
+                warnings: Vec::new(),
+                stopped_early: false,
+            };
+            app.show_results(plan, progress);
+            let submit = &app.results.as_ref().unwrap().submit;
+            assert_eq!(matches!(submit, SubmitState::Sending(_)), submitted, "{} s test", secs);
+            if !submitted {
+                assert!(matches!(submit, SubmitState::Blocked(m) if m == app.t.quick_not_submitted));
+            }
+        }
     }
 
     #[test]

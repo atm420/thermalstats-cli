@@ -495,19 +495,16 @@ fn draw_home(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     y += 1;
 
     // Verdict and tips
-    let searching = cpu.probe == Probe::Searching || (has_gpu && gpu.probe == Probe::Searching);
-    let cpu_board = cpu.source.as_deref().is_some_and(|s| s.contains("motherboard"));
-    let all_ok = cpu.probe == Probe::Found && !cpu_board && (!has_gpu || gpu.probe == Probe::Found);
-    let (mark, style, text) = if searching {
-        (pulse(app.frame), Style::new().fg(ACCENT), t.check_waiting)
-    } else if all_ok {
-        ("●", Style::new().fg(OK), t.check_all_ok)
-    } else {
-        ("▲", Style::new().fg(WARN), t.check_partial)
+    let check = sensors_ok(&cpu, &gpu, has_gpu);
+    let cpu_board = on_motherboard(&cpu);
+    let (mark, style, text) = match check {
+        None => (pulse(app.frame), Style::new().fg(ACCENT), t.check_waiting),
+        Some(true) => ("●", Style::new().fg(OK), t.check_all_ok),
+        Some(false) => ("▲", Style::new().fg(WARN), t.check_partial),
     };
     para(f, area, &mut y, Line::from(vec![Span::styled(format!("{} ", mark), style), Span::styled(text, style)]), 2);
 
-    if !searching {
+    if check.is_some() {
         // Starting warm skews the idle reading: say so before they start.
         let current = [(t.label_cpu, cpu.latest()), (t.label_gpu, if has_gpu { gpu.latest() } else { None })];
         for (part, sample) in current {
@@ -526,13 +523,39 @@ fn draw_home(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     }
 
     let by = (y + 1).min(area.bottom().saturating_sub(1));
-    draw_buttons(
+    let rows = draw_buttons(
         f,
         ctx,
         area,
         by,
         &[btn("Enter", t.btn_continue, Action::Continue, true), btn("D", t.btn_diagnostics, Action::Diagnostics, false)],
     );
+
+    // Diagnostics is only for detection problems; say so under its button
+    // (when it fits whole) so people with working sensors run a test instead.
+    let hint = match check {
+        None => return,
+        Some(true) => t.diag_hint_ok,
+        Some(false) => t.diag_hint_partial,
+    };
+    let line = Line::from(Span::styled(hint, Style::new().fg(MUTED)));
+    let mut hy = by + rows + 1;
+    if hy + wrapped_height(&line, area.width) <= area.bottom() {
+        para(f, area, &mut hy, line, 0);
+    }
+}
+
+fn on_motherboard(cpu: &Channel) -> bool {
+    cpu.source.as_deref().is_some_and(|s| s.contains("motherboard"))
+}
+
+/// Outcome of the live sensor check: `None` while still searching, else
+/// whether every temperature the test needs is read from a real sensor.
+fn sensors_ok(cpu: &Channel, gpu: &Channel, has_gpu: bool) -> Option<bool> {
+    if cpu.probe == Probe::Searching || (has_gpu && gpu.probe == Probe::Searching) {
+        return None;
+    }
+    Some(cpu.probe == Probe::Found && !on_motherboard(cpu) && (!has_gpu || gpu.probe == Probe::Found))
 }
 
 fn sensor_tips(app: &App, cpu: &Channel, gpu: &Channel, has_gpu: bool, cpu_board: bool) -> Vec<String> {
@@ -668,6 +691,8 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
                     .map(|d| {
                         if *d == 120 {
                             format!("{} ({})", app.format_duration(*d), t.recommended)
+                        } else if App::is_quick(*d) {
+                            format!("{} ({})", app.format_duration(*d), t.dur_quick)
                         } else {
                             app.format_duration(*d)
                         }
@@ -805,7 +830,11 @@ fn draw_confirm(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         (t.hu_stop.to_string(), Color::Reset),
     ];
     if app.submits() {
-        bullets.push((format!("{} {}", t.hu_auto_submit, t.submit_what), Color::Reset));
+        if App::is_quick(secs) {
+            bullets.push((t.hu_quick.to_string(), WARN));
+        } else {
+            bullets.push((format!("{} {}", t.hu_auto_submit, t.submit_what), Color::Reset));
+        }
     }
     if app.on_battery == Some(true) {
         bullets.push((t.hu_battery.to_string(), WARN));
@@ -1432,6 +1461,17 @@ fn draw_diagnostics(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     let mut y = area.y + 1;
     row(f, area, &mut y, section(t.diag_title));
     para(f, area, &mut y, Line::from(Span::styled(t.diag_intro, Style::new().fg(MUTED))), 0);
+    if matches!(diag.stage, DiagStage::Intro) {
+        let check = app.hub.as_ref().and_then(|hub| {
+            let (cpu, gpu) = hub.with(|r| (r.cpu_temp.clone_light(), r.gpu_temp.clone_light()));
+            sensors_ok(&cpu, &gpu, app.selected_gpu().is_some())
+        });
+        if check == Some(true) {
+            y += 1;
+            let style = Style::new().fg(OK);
+            para(f, area, &mut y, Line::from(vec![Span::styled("● ", style), Span::styled(t.diag_not_needed, style)]), 0);
+        }
+    }
     y += 1;
 
     let (status, buttons): (Line, Vec<Btn>) = match &diag.stage {
@@ -1831,6 +1871,12 @@ mod tests {
                     a.screen = screen;
                     render(&mut a, w, h);
                 }
+                a.form.duration = 0; // the 30 s quick test
+                a.screen = Screen::Confirm;
+                render(&mut a, w, h);
+                a.act(Action::Diagnostics);
+                render(&mut a, w, h);
+                a.screen = Screen::Home;
                 a.act(Action::Feedback);
                 render(&mut a, w, h);
                 a.modal = Some(Modal::Help);
