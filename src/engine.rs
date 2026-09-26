@@ -7,6 +7,7 @@
 
 use crate::gpus::GpuDevice;
 use crate::sensors::{Channel, SensorHub};
+use crate::series::{PartSamples, Series};
 use crate::stress::{GpuStress, StressRun, StressStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -149,6 +150,8 @@ pub struct Progress {
     pub warnings: Vec<Warning>,
     /// Stopped by the user before the planned end.
     pub stopped_early: bool,
+    /// The whole run's temperature/load curve, set when the test finishes.
+    pub series: Option<Series>,
 }
 
 pub struct Session {
@@ -170,6 +173,7 @@ impl Session {
             stress: StressStatus { cpu_threads: 0, gpu: GpuStress::Off },
             warnings: Vec::new(),
             stopped_early: false,
+            series: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -367,6 +371,12 @@ fn run(plan: &TestPlan, hub: &SensorHub, progress: &Mutex<Progress>, stop: &Atom
     hub.with(|r| {
         collect(&mut p.cpu, &r.cpu_temp, &r.cpu_usage, started, until);
         collect(&mut p.gpu, &r.gpu_temp, &r.gpu_usage, started, until);
+        p.series = Series::build(
+            plan.kind.cpu().then_some(PartSamples { temp: &r.cpu_temp.samples, usage: &r.cpu_usage.samples }),
+            plan.kind.gpu().then_some(PartSamples { temp: &r.gpu_temp.samples, usage: &r.gpu_usage.samples }),
+            started,
+            stopped,
+        );
     });
     let ran = stopped - started;
     update_warnings(&mut p, plan, &final_status, ran);

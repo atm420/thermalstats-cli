@@ -1,6 +1,7 @@
 //! ThermalStats web API: result submission, community comparison, feedback
 //! and debug logs. Blocking calls — the interface runs them on worker threads.
 
+use crate::series::Series;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
@@ -108,11 +109,28 @@ pub struct SubmissionPayload {
     pub test_duration: Option<i64>,
     pub cli_version: Option<String>,
     pub session_id: Option<String>,
+    /// The run's temperature/load curve (2.1+).
+    pub series: Option<Series>,
+    /// Before/after: an earlier result from this machine this run re-tests (2.1+).
+    pub baseline_id: Option<String>,
+    /// What changed since the baseline, one of `app::CHANGE_TYPES`.
+    pub change_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Submitted {
+    pub id: String,
+    /// The baseline the server linked this result to (None if it refused the link).
+    pub baseline_id: Option<String>,
 }
 
 /// Submit a result; returns the new result's ID.
-pub fn submit_results(site: &str, payload: &SubmissionPayload) -> Result<String, ApiError> {
-    id_of(&post(&format!("{}/api/submissions", site), payload)?)
+pub fn submit_results(site: &str, payload: &SubmissionPayload) -> Result<Submitted, ApiError> {
+    let json = post(&format!("{}/api/submissions", site), payload)?;
+    Ok(Submitted {
+        id: id_of(&json)?,
+        baseline_id: json.get("baselineId").and_then(|v| v.as_str()).map(String::from),
+    })
 }
 
 // ─── Comparison ────────────────────────────────────────────────────
@@ -127,6 +145,8 @@ pub struct CompareRequest {
     pub cpu_temp_idle: Option<f64>,
     pub gpu_temp_load: Option<f64>,
     pub gpu_temp_idle: Option<f64>,
+    /// The result just submitted, left out of the comparison.
+    pub result_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +157,18 @@ pub struct CompareEntry {
     /// "exact", "similar" or "manufacturer"
     pub scope: Option<String>,
     pub avg_load: Option<f64>,
+    /// Percentile among the exact model's results (2.1+ servers, enough data).
+    pub standing: Option<Standing>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Standing {
+    /// Share of results hotter than this one, 0–100.
+    pub cooler_than: f64,
+    /// Share of results cooler than this one, 0–100.
+    pub hotter_than: f64,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -203,6 +235,17 @@ mod tests {
     fn derives_site_root_from_v1_flag() {
         assert_eq!(site_root(DEFAULT_API_URL), "https://thermalstats.com");
         assert_eq!(site_root("http://localhost:3000/api/submissions/"), "http://localhost:3000");
+    }
+
+    #[test]
+    fn reads_standing_from_compare_replies() {
+        let json = r#"{"gpu":{"model":"NVIDIA GeForce RTX 3060","count":40,"scope":"exact","avgLoad":70,"standing":{"coolerThan":81,"hotterThan":19,"count":39}}}"#;
+        let c: Comparison = serde_json::from_str(json).unwrap();
+        let s = c.gpu.unwrap().standing.unwrap();
+        assert_eq!((s.cooler_than, s.count), (81.0, 39));
+        // Older servers: no standing.
+        let c: Comparison = serde_json::from_str(r#"{"cpu":{"model":"X","count":3,"scope":"exact","avgLoad":60}}"#).unwrap();
+        assert!(c.cpu.unwrap().standing.is_none());
     }
 
     #[test]

@@ -19,10 +19,10 @@ Pre-built binaries are available on the [Releases page](https://github.com/atm42
 ## What it does
 
 1. **Checks your hardware and sensors.** Detects the CPU, every GPU and the OS, then shows live CPU and GPU temperatures (and where each reading comes from) so you can confirm they work *before* testing. If a sensor can't be read, it tells you how to fix it. If the CPU or GPU is already warm (above 56 °C) or hot (above 65 °C), it suggests checking for background apps or letting the PC cool down first, since the test should start from idle.
-2. **Lets you choose the test.** CPU, GPU or both; which GPU to test on multi-GPU systems; duration; cooling details. Your answers are remembered for next time.
+2. **Lets you choose the test.** CPU, GPU or both; which GPU to test on multi-GPU systems; duration; cooling details. Your answers are remembered for next time. After you've submitted a result, you can also say what you changed since (cleaned out dust, new thermal paste, a new cooler, fans, an undervolt, a laptop stand): the new result is then shown next to the old one, in the app and on the website.
 3. **Warns you before loading the system.** Your PC may feel slow, fans get loud and the screen may stutter. That's expected, and you can stop at any time.
 4. **Runs the stress test.** A progress bar driven by the clock (it never stalls), the finish time, live and peak temperatures with charts, and warnings if something looks wrong (a sensor that doesn't react to load, a GPU that isn't busy, thermal throttling).
-5. **Shows results and submits them.** Idle, peak, rise and maximum load for each part. A completed test of 1 minute or longer is submitted automatically (use `--no-submit` to skip this), your results page opens in the browser, and you see how you compare with other results for the same hardware. A test stopped early is never submitted, and neither is a 30-second quick test.
+5. **Shows results and submits them.** Idle, peak, rise and maximum load for each part. A completed test of 1 minute or longer is submitted automatically together with its temperature curve (use `--no-submit` to skip this), your results page opens in the browser, and you see where your result ranks among others for the same hardware. A test stopped early is never submitted, and neither is a 30-second quick test.
 
 Press **F** at any time to send feedback (bug, idea, praise) straight from the app, or **S** to support ThermalStats.
 

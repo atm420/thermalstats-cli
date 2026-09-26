@@ -184,10 +184,14 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
         test_duration: Some(duration.as_secs() as i64),
         cli_version: Some(VERSION.into()),
         session_id: Some(machine_id(&hw)),
+        series: progress.series.as_ref().map(|s| s.only(submit_kind.cpu(), submit_kind.gpu())),
+        // Before/after re-tests are offered in the interactive interface only.
+        baseline_id: None,
+        change_type: None,
     };
     println!("\n{}", "Submitting results...".cyan());
     match api::submit_results(&site, &payload) {
-        Ok(id) => {
+        Ok(api::Submitted { id, .. }) => {
             let url = api::page_url(&site, locale, &format!("/results/{}", id));
             println!("  {} {}", "✓ Submitted! View at:".green(), url.cyan());
             crate::platform::open_url(&url);

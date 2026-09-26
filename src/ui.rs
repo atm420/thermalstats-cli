@@ -635,6 +635,7 @@ fn field_label(t: &crate::lang::Lang, field: Field) -> &'static str {
         Field::CoolerModel => t.opt_cooler_model,
         Field::LaptopModel => t.opt_laptop_model,
         Field::Ambient => t.opt_ambient,
+        Field::Retest => t.opt_retest,
     }
 }
 
@@ -719,6 +720,24 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
             Field::CoolerModel => text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.cooler_model, t.ph_cooler, focused, field),
             Field::LaptopModel => text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.laptop_model, t.ph_laptop, focused, field),
             Field::Ambient => text_field(f, ctx, Rect::new(x, y, 34.min(w), 1), &form.ambient, t.ph_ambient, focused, field),
+            Field::Retest => {
+                let mut chips = vec![t.retest_none.to_string()];
+                chips.extend(CHANGE_TYPES.iter().map(|c| app.change_label(c).to_string()));
+                let rows = chips_row(f, ctx, Rect::new(x, y, w, area.bottom() - y), &chips, form.retest, focused, field);
+                let hint = form.baseline.as_ref().map(|b| fill(t.retest_hint, &[("date", &App::result_date(b))]));
+                let hint_rows = hint.as_ref().map_or(0, |h| wrapped_height(&Line::from(h.as_str()), w));
+                // Only with room left for the key hint and buttons below.
+                match hint {
+                    Some(hint) if focused && y + rows + hint_rows + 4 <= area.bottom() => {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(hint, Style::new().fg(DIM))).wrap(Wrap { trim: true }),
+                            Rect::new(x, y + rows, w, hint_rows.min(area.bottom() - y - rows)),
+                        );
+                        rows + hint_rows
+                    }
+                    _ => rows,
+                }
+            }
         };
         y += rows.max(1);
     }
@@ -835,6 +854,12 @@ fn draw_confirm(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         } else {
             bullets.push((format!("{} {}", t.hu_auto_submit, t.submit_what), Color::Reset));
         }
+    }
+    if let (Some(change), Some(b)) = (app.form.change_type(), &app.form.baseline) {
+        bullets.push((
+            fill(t.hu_retest, &[("change", app.change_label(change)), ("date", &App::result_date(b))]),
+            Color::Reset,
+        ));
     }
     if app.on_battery == Some(true) {
         bullets.push((t.hu_battery.to_string(), WARN));
@@ -1335,18 +1360,45 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     }
     y += 1;
 
-    // Checks
-    row(f, area, &mut y, section(t.checks_title));
-    if r.plan.kind.cpu() && r.verdict.cpu_ok && !p.warnings.contains(&Warning::CpuTempFlat) {
-        row(f, area, &mut y, Line::from(vec![Span::styled("  ● ", Style::new().fg(OK)), Span::raw(t.check_cpu_ok)]));
+    // Before / after
+    if let Some((before, change)) = &r.before {
+        row(f, area, &mut y, section(&fill(t.retest_title, &[("change", app.change_label(change))])));
+        let pairs = [
+            (t.label_cpu, r.plan.kind.cpu(), before.cpu_load, p.cpu.peak),
+            (t.label_gpu, r.plan.kind.gpu(), before.gpu_load, p.gpu.peak),
+        ];
+        for (part, tested, was, now) in pairs {
+            let (true, Some(was), Some(now)) = (tested, was, now) else { continue };
+            let diff = now - was;
+            let color = if diff <= -0.5 { OK } else if diff >= 0.5 { WARN } else { MUTED };
+            para(f, area, &mut y, Line::from(vec![
+                Span::raw("  "),
+                Span::raw(fill(t.retest_row, &[("part", part), ("before", &fmt_temp(was)), ("after", &fmt_temp(now))])),
+                Span::styled(format!("  {:+.1}\u{00b0}C", diff), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            ]), 0);
+        }
+        if r.unlinked {
+            para(f, area, &mut y, Line::from(Span::styled(format!("  {}", t.retest_unlinked), Style::new().fg(MUTED))), 0);
+        }
+        y += 1;
     }
-    if r.plan.kind.gpu() && r.verdict.gpu_ok && !p.warnings.contains(&Warning::GpuTempFlat) {
-        row(f, area, &mut y, Line::from(vec![Span::styled("  ● ", Style::new().fg(OK)), Span::raw(t.check_gpu_ok)]));
+
+    // Checks. On a small console a before/after run skips them when all
+    // passed: they only reassure, and the comparison below matters more.
+    let all_passed = p.warnings.is_empty();
+    if !(all_passed && r.before.is_some() && area.height < 28) {
+        row(f, area, &mut y, section(t.checks_title));
+        if r.plan.kind.cpu() && r.verdict.cpu_ok && !p.warnings.contains(&Warning::CpuTempFlat) {
+            row(f, area, &mut y, Line::from(vec![Span::styled("  ● ", Style::new().fg(OK)), Span::raw(t.check_cpu_ok)]));
+        }
+        if r.plan.kind.gpu() && r.verdict.gpu_ok && !p.warnings.contains(&Warning::GpuTempFlat) {
+            row(f, area, &mut y, Line::from(vec![Span::styled("  ● ", Style::new().fg(OK)), Span::raw(t.check_gpu_ok)]));
+        }
+        for w in &p.warnings {
+            para(f, area, &mut y, Line::from(vec![Span::styled("▲ ", Style::new().fg(warning_color(w))), Span::raw(warning_text(app, w))]), 2);
+        }
+        y += 1;
     }
-    for w in &p.warnings {
-        para(f, area, &mut y, Line::from(vec![Span::styled("▲ ", Style::new().fg(warning_color(w))), Span::raw(warning_text(app, w))]), 2);
-    }
-    y += 1;
 
     // Submission
     let buttons: Vec<Btn> = match &r.submit {
@@ -1357,16 +1409,19 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             ]));
             vec![]
         }
-        SubmitState::Done { url } => {
+        SubmitState::Done { url, .. } => {
             row(f, area, &mut y, Line::from(Span::styled(format!("● {}", t.submitted), Style::new().fg(OK).add_modifier(Modifier::BOLD))));
             para(f, area, &mut y, Line::from(Span::raw(fill(t.view_results, &[("url", url)]))), 2);
             y += 1;
             draw_compare(f, app, area, &mut y, r);
             y += 1;
-            para(f, area, &mut y, Line::from(vec![
-                Span::styled("\u{2665} ", Style::new().fg(Color::LightRed)),
-                Span::styled(t.support_nudge, Style::new().fg(MUTED)),
-            ]), 0);
+            // Only when there's room above the buttons.
+            if y + 2 < area.bottom() {
+                para(f, area, &mut y, Line::from(vec![
+                    Span::styled("\u{2665} ", Style::new().fg(Color::LightRed)),
+                    Span::styled(t.support_nudge, Style::new().fg(MUTED)),
+                ]), 0);
+            }
             vec![
                 btn("Enter", t.btn_open, Action::OpenResults, true),
                 btn("C", t.btn_copy, Action::CopyLink, false),
@@ -1417,6 +1472,21 @@ fn draw_compare(f: &mut Frame, app: &App, area: Rect, y: &mut u16, r: &ResultsSt
                 } else {
                     t.similar_models.to_string()
                 };
+                // Newer servers send where this result ranks among the exact
+                // model's results: clearer than the average, and one line.
+                if let Some(st) = &entry.standing {
+                    let cooler = st.cooler_than >= 50.0;
+                    let pct = if cooler { st.cooler_than } else { st.hotter_than };
+                    let text = fill(if cooler { t.compare_standing_cooler } else { t.compare_standing_hotter }, &[
+                        ("part", part),
+                        ("pct", &format!("{:.0}", pct)),
+                        ("count", &st.count.to_string()),
+                        ("model", &entry.model.clone().unwrap_or_default()),
+                    ]);
+                    let color = if cooler { OK } else { WARN };
+                    para(f, area, y, Line::from(Span::styled(format!("  {}", text), Style::new().fg(color).add_modifier(Modifier::BOLD))), 0);
+                    continue;
+                }
                 let line = match entry.avg_load {
                     Some(avg) if count > 1 => {
                         let diff = yours - avg;
@@ -1898,6 +1968,79 @@ mod tests {
         }
     }
 
+    /// The before/after re-test states (2.1): the options field and its hint,
+    /// the confirm note, and the results with a comparison and percentile.
+    /// PREVIEW_RETEST=1 cargo test retest_screens -- --nocapture prints them.
+    #[test]
+    fn retest_screens_render_in_all_languages() {
+        use crate::api::{CompareEntry, Comparison, Standing};
+        use crate::engine::{Part, Phase, Progress, Verdict};
+        use crate::settings::LastResult;
+        use crate::stress::{GpuStress, StressStatus};
+        let preview = std::env::var("PREVIEW_RETEST").is_ok();
+        for (locale, _) in crate::lang::LANGUAGES {
+            for (w, h) in [(80, 24), (120, 30)] {
+                let mut a = app(locale);
+                a.form.baseline = Some(LastResult {
+                    id: "before".into(),
+                    machine_id: "m".into(),
+                    at: "2026-09-20T18:00:00+00:00".into(),
+                    test_type: "both".into(),
+                    cpu_load: Some(91.5),
+                    gpu_load: Some(78.0),
+                    ..Default::default()
+                });
+                a.form.retest = 2; // new thermal paste
+                a.form.focus = Field::Retest;
+                a.screen = Screen::Options;
+                let options = render(&mut a, w, h);
+                a.screen = Screen::Confirm;
+                let confirm = render(&mut a, w, h);
+
+                let plan = TestPlan { kind: crate::engine::TestKind::Both, duration: Duration::from_secs(120), gpu: a.selected_gpu().cloned() };
+                let progress = Progress {
+                    phase: Phase::Finished,
+                    started: None,
+                    ends: None,
+                    ends_wall: None,
+                    stopped: None,
+                    cpu: Part { idle: Some(41.0), peak: Some(80.2), usage_max: Some(100.0), ..Default::default() },
+                    gpu: Part { idle: Some(35.0), peak: Some(76.5), usage_max: Some(99.0), ..Default::default() },
+                    stress: StressStatus { cpu_threads: 16, gpu: GpuStress::Off },
+                    warnings: Vec::new(),
+                    stopped_early: false,
+                    series: None,
+                };
+                let entry = |model: &str, cooler: f64| CompareEntry {
+                    model: Some(model.into()),
+                    count: Some(40),
+                    scope: Some("exact".into()),
+                    avg_load: Some(78.0),
+                    standing: Some(Standing { cooler_than: cooler, hotter_than: 100.0 - cooler, count: 39 }),
+                };
+                a.results = Some(ResultsState {
+                    plan,
+                    progress,
+                    verdict: Verdict { kind: Some(crate::engine::TestKind::Both), cpu_ok: true, gpu_ok: true },
+                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into() },
+                    compare: CompareState::Ready(Comparison {
+                        cpu: Some(entry("AMD Ryzen 7 7800X3D", 64.0)),
+                        gpu: Some(entry("NVIDIA GeForce RTX 4080 SUPER", 30.0)),
+                    }),
+                    before: Some((a.form.baseline.clone().unwrap(), "repaste")),
+                    unlinked: true,
+                });
+                a.screen = Screen::Results;
+                let results = render(&mut a, w, h);
+                if preview && ((w == 120 && locale == "en") || (w == 80 && locale == "de")) {
+                    for screen in [options, confirm, results] {
+                        println!("{}\n{}", "=".repeat(w as usize), screen.join("\n"));
+                    }
+                }
+            }
+        }
+    }
+
     /// Secondary buttons and fields must never be light text on dark grey
     /// (unreadable in the Windows console).
     #[test]
@@ -1979,6 +2122,7 @@ mod tests {
             },
             warnings: Vec::new(),
             stopped_early: false,
+            series: None,
         };
         hub.inject(cpu, gpu, "HWiNFO / CPU (Tctl/Tdie)", "NVIDIA driver (NVML) / GPU Core");
         let plan = TestPlan { kind: crate::engine::TestKind::Both, duration: Duration::from_secs(120), gpu: a.selected_gpu().cloned() };

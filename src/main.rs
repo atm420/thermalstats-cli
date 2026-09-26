@@ -13,6 +13,7 @@ mod nvidia;
 mod plain;
 mod platform;
 mod sensors;
+mod series;
 mod settings;
 mod setup;
 mod stress;

@@ -15,6 +15,42 @@ pub struct Settings {
     pub cooling_model: Option<String>,
     pub laptop_model: Option<String>,
     pub ambient_temp: Option<f64>,
+    /// The last result this machine submitted: the "before" of a re-test.
+    pub last_result: Option<LastResult>,
+}
+
+/// Enough of a submitted result to compare a re-test against it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LastResult {
+    pub id: String,
+    pub machine_id: String,
+    /// When it was submitted (RFC 3339).
+    pub at: String,
+    pub test_type: String,
+    pub cpu_idle: Option<f64>,
+    pub cpu_load: Option<f64>,
+    pub gpu_idle: Option<f64>,
+    pub gpu_load: Option<f64>,
+}
+
+/// The server only links re-tests to results up to this old.
+const MAX_BASELINE_DAYS: i64 = 90;
+
+impl LastResult {
+    pub fn submitted_at(&self) -> Option<chrono::DateTime<chrono::Local>> {
+        chrono::DateTime::parse_from_rfc3339(&self.at).ok().map(|d| d.with_timezone(&chrono::Local))
+    }
+
+    /// Whether a new run on `machine_id` can be compared with this result.
+    pub fn usable_for(&self, machine_id: &str) -> bool {
+        !self.id.is_empty()
+            && !machine_id.is_empty()
+            && self.machine_id == machine_id
+            && self
+                .submitted_at()
+                .is_some_and(|at| (chrono::Local::now() - at).num_days() <= MAX_BASELINE_DAYS)
+    }
 }
 
 fn path() -> Option<PathBuf> {
@@ -39,5 +75,32 @@ impl Settings {
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_result_must_be_this_machine_and_recent() {
+        let recent = LastResult {
+            id: "abc".into(),
+            machine_id: "cli-1".into(),
+            at: chrono::Local::now().to_rfc3339(),
+            ..Default::default()
+        };
+        assert!(recent.usable_for("cli-1"));
+        assert!(!recent.usable_for("cli-2"));
+        let old = LastResult { at: "2020-01-01T00:00:00+00:00".into(), ..recent.clone() };
+        assert!(!old.usable_for("cli-1"));
+        let broken = LastResult { at: "yesterday".into(), ..recent };
+        assert!(!broken.usable_for("cli-1"));
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let s: Settings = serde_json::from_str(r#"{"lang":"fr","durationSecs":120}"#).unwrap();
+        assert!(s.last_result.is_none());
     }
 }

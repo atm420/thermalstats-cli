@@ -5,13 +5,13 @@
 //! runs on worker threads and reports back through `Task` slots or shared
 //! state, so the event loop always keeps drawing.
 
-use crate::api::{self, ApiError, CompareRequest, Comparison, FeedbackPayload, SubmissionPayload};
+use crate::api::{self, ApiError, CompareRequest, Comparison, FeedbackPayload, SubmissionPayload, Submitted};
 use crate::engine::{self, Phase, Progress, Session, TestKind, TestPlan, Verdict};
 use crate::gpus::GpuDevice;
 use crate::hardware::HardwareInfo;
 use crate::lang::{fill, Lang, LANGUAGES};
 use crate::sensors::SensorHub;
-use crate::settings::Settings;
+use crate::settings::{LastResult, Settings};
 use crate::setup::{Boot, BootStep, DriverState, SensorSetup};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -30,6 +30,9 @@ pub const MIN_SUBMIT_SECS: u64 = 60;
 pub const TEST_KINDS: [TestKind; 3] = [TestKind::Both, TestKind::Cpu, TestKind::Gpu];
 /// API values for the cooling choices, in display order ("" = skip).
 pub const COOLING: [&str; 7] = ["stock", "air", "aio", "custom_loop", "passive", "other", ""];
+/// What changed since the last test (API `changeType`), in display order.
+/// Must match CHANGE_TYPES in the website's src/lib/retest.ts.
+pub const CHANGE_TYPES: [&str; 7] = ["clean", "repaste", "cooler", "fans", "undervolt", "laptop_stand", "other"];
 
 /// Settings passed on the command line.
 #[derive(Debug, Clone)]
@@ -151,6 +154,8 @@ pub enum Field {
     CoolerModel,
     LaptopModel,
     Ambient,
+    /// "Changed since your last test?": makes this run a before/after re-test.
+    Retest,
 }
 
 impl Field {
@@ -171,6 +176,10 @@ pub struct Form {
     pub cooler_model: TextInput,
     pub laptop_model: TextInput,
     pub ambient: TextInput,
+    /// 0 = nothing changed; otherwise CHANGE_TYPES[retest - 1].
+    pub retest: usize,
+    /// This machine's last submitted result, if a re-test can be compared with it.
+    pub baseline: Option<LastResult>,
     pub focus: Field,
     pub error: Option<String>,
 }
@@ -205,6 +214,8 @@ impl Form {
             ),
             laptop_model: TextInput::new(settings.laptop_model.as_deref().unwrap_or(""), 120),
             ambient: TextInput::new(&ambient, 8),
+            retest: 0,
+            baseline: None,
             focus: Field::Test,
             error: None,
         }
@@ -234,7 +245,18 @@ impl Form {
             fields.push(Field::CoolerModel);
         }
         fields.push(Field::Ambient);
+        if self.baseline.is_some() {
+            fields.push(Field::Retest);
+        }
         fields
+    }
+
+    /// What changed since the baseline, when this run is a re-test.
+    pub fn change_type(&self) -> Option<&'static str> {
+        match (self.retest, &self.baseline) {
+            (0, _) | (_, None) => None,
+            (i, Some(_)) => CHANGE_TYPES.get(i - 1).copied(),
+        }
     }
 
     pub fn duration_secs(&self) -> Option<u64> {
@@ -290,6 +312,7 @@ impl Form {
             Field::Gpu => gpu_count,
             Field::Duration => DURATIONS.len() + 1,
             Field::Cooling => COOLING.len(),
+            Field::Retest => CHANGE_TYPES.len() + 1,
             _ => 0,
         }
     }
@@ -335,8 +358,8 @@ pub struct FeedbackForm {
 pub enum SubmitState {
     /// About to be sent (a completed test submits straight away).
     Ready,
-    Sending(Task<Result<String, ApiError>>),
-    Done { url: String },
+    Sending(Task<Result<Submitted, ApiError>>),
+    Done { url: String, id: String },
     Failed { reason: String, retry: bool },
     /// Can't be submitted; the reason is shown.
     Blocked(String),
@@ -355,6 +378,10 @@ pub struct ResultsState {
     pub verdict: Verdict,
     pub submit: SubmitState,
     pub compare: CompareState,
+    /// Re-test: the earlier result and what changed since.
+    pub before: Option<(LastResult, &'static str)>,
+    /// The re-test was submitted but the server didn't link it to `before`.
+    pub unlinked: bool,
 }
 
 // ─── Diagnostics ───────────────────────────────────────────────────
@@ -567,6 +594,23 @@ impl App {
         }
     }
 
+    pub fn change_label(&self, change: &str) -> &'static str {
+        match change {
+            "clean" => self.t.chg_clean,
+            "repaste" => self.t.chg_repaste,
+            "cooler" => self.t.chg_cooler,
+            "fans" => self.t.chg_fans,
+            "undervolt" => self.t.chg_undervolt,
+            "laptop_stand" => self.t.chg_laptop_stand,
+            _ => self.t.chg_other,
+        }
+    }
+
+    /// Local date of a remembered result, for "compared with your test from …".
+    pub fn result_date(result: &LastResult) -> String {
+        result.submitted_at().map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
+    }
+
     // ── Periodic updates ──
 
     pub fn tick(&mut self) {
@@ -639,6 +683,7 @@ impl App {
             self.opts.demo,
         );
         self.machine_id = machine_id(&hw);
+        self.form.baseline = self.settings.last_result.clone().filter(|r| r.usable_for(&self.machine_id));
         self.on_battery = crate::platform::on_battery();
         self.hub = Some(Arc::new(hub));
         self.hw = Some(hw);
@@ -654,16 +699,22 @@ impl App {
 
         if let SubmitState::Sending(task) = &r.submit {
             if let Some(result) = task.take() {
+                let linked = result.as_ref().ok().map(|s| s.baseline_id.is_some());
                 r.submit = match result {
-                    Ok(id) => SubmitState::Done { url: api::page_url(&self.site, &self.locale, &format!("/results/{}", id)) },
+                    Ok(Submitted { id, .. }) => SubmitState::Done {
+                        url: api::page_url(&self.site, &self.locale, &format!("/results/{}", id)),
+                        id,
+                    },
                     Err(ApiError::Connection(e)) => SubmitState::Failed { reason: e, retry: true },
                     // 429 = daily limit or duplicate: retrying won't help.
                     Err(ApiError::Rejected { status, message }) => {
                         SubmitState::Failed { reason: message, retry: status >= 500 }
                     }
                 };
-                if let SubmitState::Done { url } = &r.submit {
-                    let url = url.clone();
+                if let SubmitState::Done { url, id } = &r.submit {
+                    let (url, id) = (url.clone(), id.clone());
+                    r.unlinked = r.before.is_some() && linked == Some(false);
+                    self.remember_result(&id);
                     self.farewell_url = Some(url.clone());
                     if crate::platform::open_url(&url) {
                         self.toast = Some((fill(self.t.toast_opened, &[("url", &url)]), Instant::now()));
@@ -1053,6 +1104,10 @@ impl App {
                     self.form = form.clone();
                     self.modal = None;
                     self.save_settings();
+                    let before = self.retest_before();
+                    if let Some(r) = &mut self.results {
+                        r.before = before;
+                    }
                 }
             }
             Action::OpenResults => {
@@ -1144,6 +1199,7 @@ impl App {
                     Field::Test => target.test = value,
                     Field::Duration => target.duration = value,
                     Field::Cooling => target.cooling = value,
+                    Field::Retest => target.retest = value,
                     Field::Gpu => {
                         self.select_gpu(value);
                     }
@@ -1206,7 +1262,7 @@ impl App {
             }
         }
         match &self.results.as_ref()?.submit {
-            SubmitState::Done { url } => Some(url.clone()),
+            SubmitState::Done { url, .. } => Some(url.clone()),
             _ => None,
         }
     }
@@ -1314,10 +1370,41 @@ impl App {
             None if Self::is_quick(plan.duration.as_secs()) => SubmitState::Blocked(self.t.quick_not_submitted.to_string()),
             None => SubmitState::Ready,
         };
-        self.results = Some(ResultsState { plan, progress, verdict, submit, compare: CompareState::Idle });
+        let before = self.retest_before();
+        self.results = Some(ResultsState { plan, progress, verdict, submit, compare: CompareState::Idle, before, unlinked: false });
         self.screen = Screen::Results;
         // A completed, valid test is submitted right away.
         self.submit();
+    }
+
+    /// The earlier result a re-test compares with, and what changed.
+    fn retest_before(&self) -> Option<(LastResult, &'static str)> {
+        let change = self.form.change_type()?;
+        self.form.baseline.clone().map(|b| (b, change))
+    }
+
+    /// Keep a submitted result as the "before" for the next re-test. The
+    /// change choice resets: the next run is a plain test unless changed again.
+    fn remember_result(&mut self, id: &str) {
+        let Some(r) = &self.results else { return };
+        let Some(kind) = r.verdict.kind else { return };
+        let p = &r.progress;
+        let last = LastResult {
+            id: id.to_string(),
+            machine_id: self.machine_id.clone(),
+            at: chrono::Local::now().to_rfc3339(),
+            test_type: kind.as_str().to_string(),
+            cpu_idle: kind.cpu().then_some(p.cpu.idle).flatten(),
+            cpu_load: kind.cpu().then_some(p.cpu.peak).flatten(),
+            gpu_idle: kind.gpu().then_some(p.gpu.idle).flatten(),
+            gpu_load: kind.gpu().then_some(p.gpu.peak).flatten(),
+        };
+        self.settings.last_result = Some(last.clone());
+        if !cfg!(test) {
+            self.settings.save(); // tests must not touch the real settings file
+        }
+        self.form.baseline = Some(last);
+        self.form.retest = 0;
     }
 
     fn payload(&self, r: &ResultsState, kind: TestKind) -> SubmissionPayload {
@@ -1354,6 +1441,9 @@ impl App {
             test_duration: Some(r.plan.duration.as_secs() as i64),
             cli_version: Some(VERSION.to_string()),
             session_id: Some(self.machine_id.clone()),
+            series: p.series.as_ref().map(|s| s.only(kind.cpu(), kind.gpu())),
+            baseline_id: r.before.as_ref().map(|(b, _)| b.id.clone()),
+            change_type: r.before.as_ref().map(|(_, c)| c.to_string()),
         }
     }
 
@@ -1375,6 +1465,10 @@ impl App {
         let Some(r) = &self.results else { return };
         let Some(kind) = r.verdict.kind else { return };
         let payload = self.payload(r, kind);
+        let result_id = match &r.submit {
+            SubmitState::Done { id, .. } => Some(id.clone()),
+            _ => None,
+        };
         let request = CompareRequest {
             test_type: payload.test_type,
             cpu_model: payload.cpu_model,
@@ -1383,6 +1477,7 @@ impl App {
             cpu_temp_idle: payload.cpu_temp_idle,
             gpu_temp_load: payload.gpu_temp_load,
             gpu_temp_idle: payload.gpu_temp_idle,
+            result_id,
         };
         let site = self.site.clone();
         let task = Task::spawn("compare", Err(ApiError::Connection("unexpected error".into())), move || {
@@ -1591,6 +1686,7 @@ fn edit_form(form: &mut Form, fields: &[Field], key: &KeyEvent, gpu_count: usize
                 Field::Test => form.test = step(form.test, left),
                 Field::Duration => form.duration = step(form.duration, left),
                 Field::Cooling => form.cooling = step(form.cooling, left),
+                Field::Retest => form.retest = step(form.retest, left),
                 Field::Gpu => {} // applied by the caller
                 _ => {}
             }
@@ -1744,6 +1840,7 @@ mod tests {
                 stress: crate::stress::StressStatus { cpu_threads: 8, gpu: crate::stress::GpuStress::Off },
                 warnings: Vec::new(),
                 stopped_early: false,
+                series: None,
             };
             app.show_results(plan, progress);
             let submit = &app.results.as_ref().unwrap().submit;
@@ -1752,6 +1849,71 @@ mod tests {
                 assert!(matches!(submit, SubmitState::Blocked(m) if m == app.t.quick_not_submitted));
             }
         }
+    }
+
+    fn finished_cpu_run(secs: u64) -> (TestPlan, Progress) {
+        let plan = TestPlan { kind: TestKind::Cpu, duration: Duration::from_secs(secs), gpu: None };
+        let progress = Progress {
+            phase: Phase::Finished,
+            started: None,
+            ends: None,
+            ends_wall: None,
+            stopped: None,
+            cpu: engine::Part { idle: Some(40.0), peak: Some(80.0), ..Default::default() },
+            gpu: engine::Part::default(),
+            stress: crate::stress::StressStatus { cpu_threads: 8, gpu: crate::stress::GpuStress::Off },
+            warnings: Vec::new(),
+            stopped_early: false,
+            series: None,
+        };
+        (plan, progress)
+    }
+
+    #[test]
+    fn retest_links_to_the_last_result() {
+        let mut o = opts();
+        o.no_submit = true; // nothing is sent; only the payload is checked
+        let mut app = App::new("en".into(), o);
+        app.machine_id = "cli-test".into();
+        let baseline = LastResult {
+            id: "before-id".into(),
+            machine_id: "cli-test".into(),
+            at: chrono::Local::now().to_rfc3339(),
+            test_type: "cpu".into(),
+            cpu_load: Some(90.0),
+            ..Default::default()
+        };
+        app.form.baseline = Some(baseline);
+
+        // Nothing changed: a plain run, and no re-test field answer to send.
+        assert!(app.form.fields(false, 1, false).contains(&Field::Retest));
+        let (plan, progress) = finished_cpu_run(120);
+        app.show_results(plan, progress);
+        let r = app.results.as_ref().unwrap();
+        let payload = app.payload(r, TestKind::Cpu);
+        assert_eq!((payload.baseline_id, payload.change_type), (None, None));
+
+        // New paste: linked to the baseline.
+        app.form.retest = CHANGE_TYPES.iter().position(|c| *c == "repaste").unwrap() + 1;
+        let (plan, progress) = finished_cpu_run(120);
+        app.show_results(plan, progress);
+        let r = app.results.as_ref().unwrap();
+        let payload = app.payload(r, TestKind::Cpu);
+        assert_eq!(payload.baseline_id.as_deref(), Some("before-id"));
+        assert_eq!(payload.change_type.as_deref(), Some("repaste"));
+
+        // Once submitted, this run becomes the next baseline and the choice resets.
+        app.remember_result("after-id");
+        assert_eq!(app.form.baseline.as_ref().map(|b| b.id.as_str()), Some("after-id"));
+        assert_eq!(app.form.baseline.as_ref().and_then(|b| b.cpu_load), Some(80.0));
+        assert_eq!(app.form.retest, 0);
+    }
+
+    #[test]
+    fn no_retest_field_without_a_baseline() {
+        let form = Form::new(&Settings::default(), &opts());
+        assert!(!form.fields(false, 1, false).contains(&Field::Retest));
+        assert_eq!(form.change_type(), None);
     }
 
     #[test]
