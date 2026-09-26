@@ -1147,7 +1147,8 @@ impl App {
                 }));
             }
             Action::Support => {
-                let url = api::page_url(&self.site, &self.locale, "/support");
+                // ref=cli lets the site count this visit as a CLI support click
+                let url = api::page_url(&self.site, &self.locale, "/support?ref=cli");
                 self.open(&url);
             }
             Action::Help => self.modal = Some(Modal::Help),
