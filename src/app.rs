@@ -28,8 +28,11 @@ pub const DURATIONS: [u64; 5] = [30, 60, 120, 180, 300];
 /// Shorter tests are quick checks: the results are shown but never submitted.
 pub const MIN_SUBMIT_SECS: u64 = 60;
 pub const TEST_KINDS: [TestKind; 3] = [TestKind::Both, TestKind::Cpu, TestKind::Gpu];
-/// API values for the cooling choices, in display order ("" = skip).
-pub const COOLING: [&str; 7] = ["stock", "air", "aio", "custom_loop", "passive", "other", ""];
+/// API values for the cooling choices, in display order. "unsure" is the
+/// honest way out and sends nothing; the form starts with nothing chosen
+/// (index COOLING.len()) and desktops must pick one before testing, because
+/// comparisons and recommendations depend on it.
+pub const COOLING: [&str; 7] = ["stock", "air", "aio", "custom_loop", "passive", "other", "unsure"];
 /// What changed since the last test (API `changeType`), in display order.
 /// Must match CHANGE_TYPES in the website's src/lib/retest.ts.
 pub const CHANGE_TYPES: [&str; 7] = ["clean", "repaste", "cooler", "fans", "undervolt", "laptop_stand", "other"];
@@ -196,7 +199,7 @@ impl Form {
             None => (DURATIONS.len(), secs.to_string()),
         };
         let cooling_value = opts.cooling_type.clone().or(settings.cooling_type.clone()).unwrap_or_default();
-        let cooling = COOLING.iter().position(|c| *c == cooling_value).unwrap_or(COOLING.len() - 1);
+        let cooling = COOLING.iter().position(|c| *c == cooling_value).unwrap_or(COOLING.len());
         let ambient = opts
             .ambient_temp
             .or(settings.ambient_temp)
@@ -292,8 +295,12 @@ impl Form {
             // Laptops use their built-in cooling unless told otherwise.
             return opts.cooling_type.clone().or(Some("stock".into()));
         }
-        let value = COOLING[self.cooling];
-        (!value.is_empty()).then(|| value.to_string())
+        COOLING.get(self.cooling).filter(|c| **c != "unsure").map(|c| c.to_string())
+    }
+
+    /// Whether the cooling question has an answer ("Not sure" counts).
+    pub fn cooling_answered(&self) -> bool {
+        self.cooling < COOLING.len()
     }
 
     fn text_mut(&mut self, field: Field) -> Option<&mut TextInput> {
@@ -590,7 +597,7 @@ impl App {
             "custom_loop" => self.t.cool_custom,
             "passive" => self.t.cool_passive,
             "other" => self.t.cool_other,
-            _ => self.t.cool_skip,
+            _ => self.t.cool_unsure,
         }
     }
 
@@ -658,12 +665,14 @@ impl App {
                 cpu_threads: None,
                 os: None,
                 is_laptop: false,
+                system_model: None,
                 gpus: Vec::new(),
             });
             self.screen = Screen::Home;
             return;
         };
         let Boot { hw, setup } = boot;
+        self.prefill_laptop_model(&hw);
 
         // Prefer the GPU picked last time, else the best dedicated card.
         self.gpu_index = self
@@ -691,6 +700,16 @@ impl App {
         self.screen = if self.opts.diagnostics { Screen::Diagnostics } else { Screen::Home };
         if self.opts.diagnostics {
             self.open_diagnostics();
+        }
+    }
+
+    /// Laptops: start from what the BIOS calls the model, unless the user
+    /// already typed one. It stays editable.
+    fn prefill_laptop_model(&mut self, hw: &HardwareInfo) {
+        if hw.is_laptop && self.form.laptop_model.value.trim().is_empty() {
+            if let Some(model) = &hw.system_model {
+                self.form.laptop_model = TextInput::new(model, 120);
+            }
         }
     }
 
@@ -1096,9 +1115,15 @@ impl App {
                 self.modal = Some(Modal::EditDetails(form));
             }
             Action::SaveDetails => {
+                let laptop = self.is_laptop();
                 if let Some(Modal::EditDetails(form)) = &mut self.modal {
                     if form.ambient_celsius().is_err() {
                         form.error = Some(self.t.err_ambient.to_string());
+                        return;
+                    }
+                    if !laptop && !form.cooling_answered() {
+                        form.error = Some(self.t.err_cooling.to_string());
+                        form.focus = Field::Cooling;
                         return;
                     }
                     self.form = form.clone();
@@ -1303,6 +1328,11 @@ impl App {
             self.form.focus = Field::Ambient;
             return;
         }
+        if !self.is_laptop() && !self.form.cooling_answered() {
+            self.form.error = Some(self.t.err_cooling.to_string());
+            self.form.focus = Field::Cooling;
+            return;
+        }
         if self.form.kind().gpu() && self.gpus().is_empty() {
             self.form.test = TEST_KINDS.iter().position(|k| *k == TestKind::Cpu).unwrap();
         }
@@ -1319,11 +1349,13 @@ impl App {
         if laptop {
             self.settings.laptop_model = self.form.laptop_model.trimmed();
         } else {
-            self.settings.cooling_type = Some(COOLING[self.form.cooling].to_string()).filter(|c| !c.is_empty());
+            self.settings.cooling_type = COOLING.get(self.form.cooling).map(|c| c.to_string());
             self.settings.cooling_model = self.form.cooler_model.trimmed();
         }
         self.settings.ambient_temp = self.form.ambient_celsius().ok().flatten();
-        self.settings.save();
+        if !cfg!(test) {
+            self.settings.save(); // tests must not touch the real settings file
+        }
     }
 
     fn start_test(&mut self) {
@@ -1679,7 +1711,13 @@ fn edit_form(form: &mut Form, fields: &[Field], key: &KeyEvent, gpu_count: usize
     if count == 0 {
         return false;
     }
-    let step = |current: usize, left: bool| if left { (current + count - 1) % count } else { (current + 1) % count };
+    let step = |current: usize, left: bool| match (current >= count, left) {
+        // Nothing chosen yet (the cooling question starts empty)
+        (true, true) => count - 1,
+        (true, false) => 0,
+        (false, true) => (current + count - 1) % count,
+        (false, false) => (current + 1) % count,
+    };
     match key.code {
         KeyCode::Left | KeyCode::Right => {
             let left = key.code == KeyCode::Left;
@@ -1808,6 +1846,93 @@ mod tests {
         assert!(form.ambient_celsius().is_err());
         form.ambient = TextInput::new("95", 8);
         assert!(form.ambient_celsius().is_err());
+    }
+
+    /// An app on detected hardware, with a fresh form (not the real settings file).
+    fn app_on(cpu: &str, laptop: bool, system_model: Option<&str>) -> App {
+        let mut app = App::new("en".into(), opts());
+        app.settings = Settings::default();
+        app.form = Form::new(&app.settings, &app.opts);
+        app.hw = Some(HardwareInfo {
+            cpu_model: Some(cpu.into()),
+            cpu_cores: None,
+            cpu_threads: None,
+            os: None,
+            is_laptop: laptop,
+            system_model: system_model.map(String::from),
+            gpus: Vec::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn desktops_must_answer_the_cooling_question() {
+        let mut app = app_on("AMD Ryzen 5 5600X", false, None);
+        // A new install, or a skip on an older version, starts unanswered
+        assert!(!app.form.cooling_answered());
+        app.confirm_options();
+        assert_eq!(app.form.error.as_deref(), Some(app.t.err_cooling));
+        assert_eq!(app.form.focus, Field::Cooling);
+        assert_ne!(app.screen, Screen::Confirm);
+
+        // "Not sure" is an answer: the test can start, and it sends nothing
+        app.form.cooling = COOLING.iter().position(|c| *c == "unsure").unwrap();
+        app.confirm_options();
+        assert_eq!(app.screen, Screen::Confirm);
+        assert_eq!(app.form.cooling_type(false, &app.opts), None);
+        assert_eq!(app.settings.cooling_type.as_deref(), Some("unsure"));
+
+        app.form.cooling = COOLING.iter().position(|c| *c == "air").unwrap();
+        assert_eq!(app.form.cooling_type(false, &app.opts).as_deref(), Some("air"));
+    }
+
+    #[test]
+    fn laptops_are_not_asked_about_cooling() {
+        let mut app = app_on("Intel Core i7-13700H", true, None);
+        app.confirm_options();
+        assert_eq!(app.screen, Screen::Confirm);
+        assert_eq!(app.form.cooling_type(true, &app.opts).as_deref(), Some("stock"));
+        assert!(!app.form.fields(true, 1, false).contains(&Field::Cooling));
+    }
+
+    #[test]
+    fn remembered_cooling_answers_carry_over() {
+        let form = |cooling: Option<&str>| {
+            let settings = Settings { cooling_type: cooling.map(String::from), ..Default::default() };
+            Form::new(&settings, &opts())
+        };
+        assert!(!form(None).cooling_answered());
+        assert!(!form(Some("")).cooling_answered()); // "Skip" saved by 2.1.0
+        assert_eq!(COOLING[form(Some("aio")).cooling], "aio");
+        assert_eq!(COOLING[form(Some("unsure")).cooling], "unsure");
+    }
+
+    #[test]
+    fn arrow_keys_start_from_an_unanswered_cooling_question() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut form = Form::new(&Settings::default(), &opts());
+        form.focus = Field::Cooling;
+        let fields = form.fields(false, 1, false);
+        edit_form(&mut form, &fields, &key(KeyCode::Right), 1);
+        assert_eq!(COOLING[form.cooling], "stock");
+
+        let mut form = Form::new(&Settings::default(), &opts());
+        form.focus = Field::Cooling;
+        edit_form(&mut form, &fields, &key(KeyCode::Left), 1);
+        assert_eq!(COOLING[form.cooling], "unsure");
+    }
+
+    #[test]
+    fn laptop_model_starts_from_the_bios() {
+        let mut app = app_on("Intel Core i7-13700H", true, Some("Lenovo Legion 5 15ACH6H"));
+        let hw = app.hw.clone().unwrap();
+        app.prefill_laptop_model(&hw);
+        assert_eq!(app.form.laptop_model.value, "Lenovo Legion 5 15ACH6H");
+
+        // What the user typed wins
+        app.form.laptop_model = TextInput::new("Legion 5 Pro", 120);
+        app.prefill_laptop_model(&hw);
+        assert_eq!(app.form.laptop_model.value, "Legion 5 Pro");
     }
 
     #[test]

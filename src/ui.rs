@@ -714,7 +714,18 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
             }
             Field::Cooling => {
                 let chips: Vec<String> = COOLING.iter().map(|c| app.cooling_label(c).to_string()).collect();
-                chips_row(f, ctx, Rect::new(x, y, w, area.bottom() - y), &chips, form.cooling, focused, field)
+                let rows = chips_row(f, ctx, Rect::new(x, y, w, area.bottom() - y), &chips, form.cooling, focused, field);
+                // Why it's asked, and stock vs air (the error moves focus here too)
+                if focused && y + rows < area.bottom() {
+                    let hint_rows = wrapped_height(&Line::from(t.cooling_hint), w);
+                    f.render_widget(
+                        Paragraph::new(Span::styled(t.cooling_hint, Style::new().fg(DIM))).wrap(Wrap { trim: true }),
+                        Rect::new(x, y + rows, w, hint_rows.min(area.bottom() - y - rows)),
+                    );
+                    rows + hint_rows
+                } else {
+                    rows
+                }
             }
             Field::CustomSecs => text_field(f, ctx, Rect::new(x, y, 12.min(w), 1), &form.custom_secs, t.ph_custom_secs, focused, field),
             Field::CoolerModel => text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.cooler_model, t.ph_cooler, focused, field),
@@ -1915,6 +1926,7 @@ mod tests {
             cpu_threads: Some(16),
             os: Some("Windows 11 (26100)".into()),
             is_laptop: false,
+            system_model: None,
             gpus,
         });
         app.screen = Screen::Home;
@@ -2035,6 +2047,30 @@ mod tests {
                 if preview && ((w == 120 && locale == "en") || (w == 80 && locale == "de")) {
                     for screen in [options, confirm, results] {
                         println!("{}\n{}", "=".repeat(w as usize), screen.join("\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The unanswered cooling question: error, hint and choices fit in every
+    /// language at the minimum console size.
+    #[test]
+    fn cooling_question_renders_with_its_error() {
+        for (locale, _) in crate::lang::LANGUAGES {
+            for (w, h) in [(80, 24), (120, 30)] {
+                let mut a = app(locale);
+                a.form.cooling = COOLING.len(); // unanswered
+                a.screen = Screen::Options;
+                a.act(Action::Continue);
+                assert_eq!(a.screen, Screen::Options, "{locale}: started without a cooling answer");
+                assert_eq!(a.form.focus, Field::Cooling);
+                let lines = render(&mut a, w, h).join("\n");
+                if locale == "en" {
+                    assert!(lines.contains("Not sure"), "{lines}");
+                    assert!(lines.contains("Choose your CPU cooling"), "{lines}");
+                    if std::env::var("SHOW_FORM").is_ok() && w == 80 {
+                        println!("{lines}");
                     }
                 }
             }

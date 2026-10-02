@@ -394,7 +394,7 @@ unsafe fn reg_raw(
 }
 
 #[cfg(windows)]
-unsafe fn reg_string(
+pub(crate) unsafe fn reg_string(
     key: windows_sys::Win32::System::Registry::HKEY,
     subkey: &str,
     value: &str,

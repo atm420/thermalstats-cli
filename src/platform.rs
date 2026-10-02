@@ -341,6 +341,41 @@ pub fn on_battery() -> Option<bool> {
     }
 }
 
+/// The BIOS's own description of the machine (SMBIOS system information),
+/// used to prefill the laptop model. None where it can't be read.
+pub fn system_identity() -> Option<crate::hardware::SystemIdentity> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+        const BIOS: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
+        let read = |name: &str| crate::gpus::reg_string(HKEY_LOCAL_MACHINE, BIOS, name).unwrap_or_default();
+        Some(crate::hardware::SystemIdentity {
+            vendor: read("SystemManufacturer"),
+            product: read("SystemProductName"),
+            version: read("SystemVersion"),
+            family: read("SystemFamily"),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("/sys/class/dmi/id/{}", name)).map(|s| s.trim().to_string()).unwrap_or_default()
+        };
+        Some(crate::hardware::SystemIdentity {
+            vendor: read("sys_vendor"),
+            product: read("product_name"),
+            version: read("product_version"),
+            family: read("product_family"),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        None
+    }
+}
+
 /// Whether the machine has a battery (used for laptop detection).
 pub fn has_battery() -> bool {
     #[cfg(windows)]

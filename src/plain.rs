@@ -37,6 +37,9 @@ fn print_hardware(hw: &crate::hardware::HardwareInfo) {
     }
     println!("  OS:     {}", hw.os.as_deref().unwrap_or("Unknown"));
     println!("  Type:   {}", if hw.is_laptop { "Laptop" } else { "Desktop" });
+    if let Some(model) = &hw.system_model {
+        println!("  Model:  {}", model);
+    }
 }
 
 fn temp(v: Option<f64>) -> String {
@@ -171,7 +174,7 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
         gpu_vram: gpu.as_ref().and_then(|g| g.vram()),
         os: hw.os.clone(),
         device_type: Some(if laptop { "laptop" } else { "desktop" }.into()),
-        laptop_model: None,
+        laptop_model: if laptop { hw.system_model.clone() } else { None },
         cooling_type: opts.cooling_type.clone().or(if laptop { Some("stock".into()) } else { None }),
         cooling_model: opts.cooling_model.clone(),
         ambient_temp: opts.ambient_temp.filter(|a| (0.0..=60.0).contains(a)),

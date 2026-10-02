@@ -43,6 +43,7 @@ pub fn collect(hw: &HardwareInfo, setup: &SensorSetup, gpu_index: Option<usize>,
     }
     line(format!("OS: {}", hw.os.as_deref().unwrap_or("N/A")));
     line(format!("Device Type: {}", if hw.is_laptop { "Laptop" } else { "Desktop" }));
+    line(format!("System Model: {}", hw.system_model.as_deref().unwrap_or("unknown")));
     if let Some(battery) = crate::platform::on_battery() {
         line(format!("Power: {}", if battery { "BATTERY" } else { "AC" }));
     }
