@@ -2034,7 +2034,7 @@ mod tests {
                     plan,
                     progress,
                     verdict: Verdict { kind: Some(crate::engine::TestKind::Both), cpu_ok: true, gpu_ok: true },
-                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into() },
+                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into(), claim: None },
                     compare: CompareState::Ready(Comparison {
                         cpu: Some(entry("AMD Ryzen 7 7800X3D", 64.0)),
                         gpu: Some(entry("NVIDIA GeForce RTX 4080 SUPER", 30.0)),

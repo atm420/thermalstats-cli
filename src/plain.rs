@@ -194,10 +194,10 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
     };
     println!("\n{}", "Submitting results...".cyan());
     match api::submit_results(&site, &payload) {
-        Ok(api::Submitted { id, .. }) => {
+        Ok(api::Submitted { id, claim_token, .. }) => {
             let url = api::page_url(&site, locale, &format!("/results/{}", id));
             println!("  {} {}", "✓ Submitted! View at:".green(), url.cyan());
-            crate::platform::open_url(&url);
+            crate::platform::open_url(&api::with_claim(&url, claim_token.as_deref()));
             0
         }
         Err(e) => {

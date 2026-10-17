@@ -122,6 +122,10 @@ pub struct Submitted {
     pub id: String,
     /// The baseline the server linked this result to (None if it refused the link).
     pub baseline_id: Option<String>,
+    /// One-time secret that lets whoever ran the test save it to a ThermalStats
+    /// account (2.2+, servers with accounts on). Only ever goes in the URL
+    /// fragment of the page we open, never in a link we show or copy.
+    pub claim_token: Option<String>,
 }
 
 /// Submit a result; returns the new result's ID.
@@ -130,7 +134,22 @@ pub fn submit_results(site: &str, payload: &SubmissionPayload) -> Result<Submitt
     Ok(Submitted {
         id: id_of(&json)?,
         baseline_id: json.get("baselineId").and_then(|v| v.as_str()).map(String::from),
+        claim_token: json
+            .get("claimToken")
+            .and_then(|v| v.as_str())
+            .filter(|t| (20..=100).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            .map(String::from),
     })
+}
+
+/// The results URL to open in the browser: with the claim token in the
+/// fragment, which browsers never send to the server. The page stores it and
+/// removes it from the address bar.
+pub fn with_claim(url: &str, claim_token: Option<&str>) -> String {
+    match claim_token {
+        Some(token) => format!("{}#claim={}", url, token),
+        None => url.to_string(),
+    }
 }
 
 // ─── Comparison ────────────────────────────────────────────────────
@@ -230,6 +249,13 @@ pub fn submit_debug_log(site: &str, payload: &DebugLogPayload) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_token_only_goes_in_the_fragment() {
+        let url = "https://thermalstats.com/fr/results/abc";
+        assert_eq!(with_claim(url, None), url);
+        assert_eq!(with_claim(url, Some("tok_EN-123")), "https://thermalstats.com/fr/results/abc#claim=tok_EN-123");
+    }
 
     #[test]
     fn derives_site_root_from_v1_flag() {

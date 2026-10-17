@@ -366,7 +366,9 @@ pub enum SubmitState {
     /// About to be sent (a completed test submits straight away).
     Ready,
     Sending(Task<Result<Submitted, ApiError>>),
-    Done { url: String, id: String },
+    /// `claim` opens the page with the token that lets the user save the
+    /// result to an account; `url` (shown, copied, printed on exit) never has it.
+    Done { url: String, id: String, claim: Option<String> },
     Failed { reason: String, retry: bool },
     /// Can't be submitted; the reason is shown.
     Blocked(String),
@@ -720,9 +722,10 @@ impl App {
             if let Some(result) = task.take() {
                 let linked = result.as_ref().ok().map(|s| s.baseline_id.is_some());
                 r.submit = match result {
-                    Ok(Submitted { id, .. }) => SubmitState::Done {
+                    Ok(Submitted { id, claim_token, .. }) => SubmitState::Done {
                         url: api::page_url(&self.site, &self.locale, &format!("/results/{}", id)),
                         id,
+                        claim: claim_token,
                     },
                     Err(ApiError::Connection(e)) => SubmitState::Failed { reason: e, retry: true },
                     // 429 = daily limit or duplicate: retrying won't help.
@@ -730,12 +733,12 @@ impl App {
                         SubmitState::Failed { reason: message, retry: status >= 500 }
                     }
                 };
-                if let SubmitState::Done { url, id } = &r.submit {
-                    let (url, id) = (url.clone(), id.clone());
+                if let SubmitState::Done { url, id, claim } = &r.submit {
+                    let (url, id, open) = (url.clone(), id.clone(), api::with_claim(url, claim.as_deref()));
                     r.unlinked = r.before.is_some() && linked == Some(false);
                     self.remember_result(&id);
                     self.farewell_url = Some(url.clone());
-                    if crate::platform::open_url(&url) {
+                    if crate::platform::open_url(&open) {
                         self.toast = Some((fill(self.t.toast_opened, &[("url", &url)]), Instant::now()));
                     }
                     self.start_compare();
@@ -1136,9 +1139,13 @@ impl App {
                 }
             }
             Action::OpenResults => {
-                let url = self.current_url();
-                if let Some(url) = url {
-                    self.open(&url);
+                if let Some(url) = self.current_url() {
+                    // Reopening a result keeps its claim token (the first open may have failed).
+                    let claim = match self.results.as_ref().map(|r| &r.submit) {
+                        Some(SubmitState::Done { claim, .. }) if self.screen != Screen::Diagnostics => claim.clone(),
+                        _ => None,
+                    };
+                    self.open_as(&api::with_claim(&url, claim.as_deref()), &url);
                 }
             }
             Action::CopyLink => {
@@ -1273,10 +1280,16 @@ impl App {
     }
 
     fn open(&mut self, url: &str) {
-        let msg = if crate::platform::open_url(url) {
-            fill(self.t.toast_opened, &[("url", url)])
+        self.open_as(url, url);
+    }
+
+    /// Opens `target` in the browser; the message names `shown` (a results
+    /// link without its claim token).
+    fn open_as(&mut self, target: &str, shown: &str) {
+        let msg = if crate::platform::open_url(target) {
+            fill(self.t.toast_opened, &[("url", shown)])
         } else {
-            fill(self.t.toast_open_failed, &[("url", url)])
+            fill(self.t.toast_open_failed, &[("url", shown)])
         };
         self.toast(msg);
     }
