@@ -5,7 +5,7 @@
 //! runs on worker threads and reports back through `Task` slots or shared
 //! state, so the event loop always keeps drawing.
 
-use crate::api::{self, ApiError, CompareRequest, Comparison, FeedbackPayload, SubmissionPayload, Submitted};
+use crate::api::{self, ApiError, CompareRequest, Comparison, DeviceCode, FeedbackPayload, LinkPoll, SubmissionPayload, Submitted};
 use crate::engine::{self, Phase, Progress, Session, TestKind, TestPlan, Verdict};
 use crate::gpus::GpuDevice;
 use crate::hardware::HardwareInfo;
@@ -368,7 +368,7 @@ pub enum SubmitState {
     Sending(Task<Result<Submitted, ApiError>>),
     /// `claim` opens the page with the token that lets the user save the
     /// result to an account; `url` (shown, copied, printed on exit) never has it.
-    Done { url: String, id: String, claim: Option<String> },
+    Done { url: String, id: String, claim: Option<String>, saved: bool },
     Failed { reason: String, retry: bool },
     /// Can't be submitted; the reason is shown.
     Blocked(String),
@@ -433,6 +433,29 @@ pub enum Modal {
     StopTest,
     EditDetails(Form),
     Pawnio { removing: Option<Task<Result<(), String>>>, error: Option<String> },
+    Account(LinkState),
+}
+
+/// Linking this PC to a ThermalStats account (the A key). The website shows
+/// the same code; once the user approves it there, results submitted from
+/// here save to their account (see api::poll_link).
+pub enum LinkState {
+    /// Not linked: what linking does.
+    Intro,
+    Requesting(Task<Result<DeviceCode, ApiError>>),
+    /// Waiting for the user to approve `code` on the website.
+    Waiting {
+        code: DeviceCode,
+        poll: Option<Task<Result<LinkPoll, ApiError>>>,
+        next_poll: Instant,
+        interval: Duration,
+        expires: Instant,
+    },
+    /// Linked; adding this PC's earlier results to the account.
+    Importing { email: String, task: Task<Result<u64, ApiError>> },
+    Linked { email: String, imported: Option<u64> },
+    Unlinking(Task<Result<(), ApiError>>),
+    Failed(String),
 }
 
 /// Something the user can trigger by key or click.
@@ -470,6 +493,10 @@ pub enum Action {
     FbSend,
     KeepPawnio,
     UninstallPawnio,
+    Account,
+    LinkStart,
+    LinkOpenBrowser,
+    Unlink,
 }
 
 pub struct App {
@@ -654,6 +681,7 @@ impl App {
 
         self.tick_results();
         self.tick_feedback();
+        self.tick_account();
         self.tick_diagnostics();
         self.tick_pawnio();
     }
@@ -721,11 +749,13 @@ impl App {
         if let SubmitState::Sending(task) = &r.submit {
             if let Some(result) = task.take() {
                 let linked = result.as_ref().ok().map(|s| s.baseline_id.is_some());
+                let link_revoked = result.as_ref().is_ok_and(|s| s.link_invalid);
                 r.submit = match result {
-                    Ok(Submitted { id, claim_token, .. }) => SubmitState::Done {
+                    Ok(Submitted { id, claim_token, saved, .. }) => SubmitState::Done {
                         url: api::page_url(&self.site, &self.locale, &format!("/results/{}", id)),
                         id,
                         claim: claim_token,
+                        saved,
                     },
                     Err(ApiError::Connection(e)) => SubmitState::Failed { reason: e, retry: true },
                     // 429 = daily limit or duplicate: retrying won't help.
@@ -733,12 +763,17 @@ impl App {
                         SubmitState::Failed { reason: message, retry: status >= 500 }
                     }
                 };
-                if let SubmitState::Done { url, id, claim } = &r.submit {
+                if let SubmitState::Done { url, id, claim, .. } = &r.submit {
                     let (url, id, open) = (url.clone(), id.clone(), api::with_claim(url, claim.as_deref()));
                     r.unlinked = r.before.is_some() && linked == Some(false);
                     self.remember_result(&id);
                     self.farewell_url = Some(url.clone());
-                    if crate::platform::open_url(&open) {
+                    if link_revoked {
+                        // Unlinked on the website: forget the token, say so.
+                        self.settings.account = None;
+                        self.settings.save();
+                        self.toast = Some((self.t.toast_link_invalid.to_string(), Instant::now()));
+                    } else if crate::platform::open_url(&open) {
                         self.toast = Some((fill(self.t.toast_opened, &[("url", &url)]), Instant::now()));
                     }
                     self.start_compare();
@@ -756,6 +791,107 @@ impl App {
                 };
             }
         }
+    }
+
+    fn tick_account(&mut self) {
+        if !matches!(self.modal, Some(Modal::Account(_))) {
+            return;
+        }
+        let (site, locale, machine, name) = (self.site.clone(), self.locale.clone(), self.machine_id.clone(), self.machine_name());
+        let t = &self.t;
+        let (failed, expired, denied) = (t.acct_failed, t.acct_expired, t.acct_denied);
+        let Some(Modal::Account(state)) = &mut self.modal else { return };
+        let now = Instant::now();
+        let fail = |e: &ApiError| LinkState::Failed(fill(failed, &[("reason", &e.to_string())]));
+
+        enum Outcome {
+            Stay,
+            Next(LinkState),
+            Linked(crate::settings::AccountLink),
+            Unlinked,
+        }
+        let outcome = match state {
+            LinkState::Requesting(task) => match task.take() {
+                Some(Ok(code)) => {
+                    crate::platform::open_url(&code.approve_url(&site, &locale));
+                    let interval = Duration::from_secs(code.interval.clamp(1, 60));
+                    Outcome::Next(LinkState::Waiting {
+                        expires: now + Duration::from_secs(code.expires_in.clamp(60, 3600)),
+                        next_poll: now + interval,
+                        interval,
+                        poll: None,
+                        code,
+                    })
+                }
+                Some(Err(e)) => Outcome::Next(fail(&e)),
+                None => Outcome::Stay,
+            },
+            LinkState::Waiting { code, poll, next_poll, interval, expires } => {
+                if now > *expires {
+                    Outcome::Next(LinkState::Failed(expired.to_string()))
+                } else if let Some(task) = poll {
+                    match task.take() {
+                        None => Outcome::Stay,
+                        Some(answer) => {
+                            *poll = None;
+                            *next_poll = now + *interval;
+                            match answer {
+                                Ok(LinkPoll::Pending) => Outcome::Stay,
+                                Ok(LinkPoll::SlowDown) => {
+                                    *interval += Duration::from_secs(5);
+                                    *next_poll = now + *interval;
+                                    Outcome::Stay
+                                }
+                                // Offline for a moment: keep trying until the code expires.
+                                Err(ApiError::Connection(_)) => Outcome::Stay,
+                                Ok(LinkPoll::Linked(link)) => Outcome::Linked(link),
+                                Ok(LinkPoll::Denied) => Outcome::Next(LinkState::Failed(denied.to_string())),
+                                Ok(LinkPoll::Expired) => Outcome::Next(LinkState::Failed(expired.to_string())),
+                                Err(e) => Outcome::Next(fail(&e)),
+                            }
+                        }
+                    }
+                } else {
+                    if now >= *next_poll {
+                        let (site, code, name, machine) = (site.clone(), code.clone(), name.clone(), machine.clone());
+                        *poll = Some(Task::spawn("link-poll", Err(ApiError::Connection("unexpected error".into())), move || {
+                            api::poll_link(&site, &code, &name, &machine)
+                        }));
+                    }
+                    Outcome::Stay
+                }
+            }
+            LinkState::Importing { email, task } => match task.take() {
+                Some(n) => Outcome::Next(LinkState::Linked { email: email.clone(), imported: n.ok() }),
+                None => Outcome::Stay,
+            },
+            LinkState::Unlinking(task) => {
+                if task.take().is_some() { Outcome::Unlinked } else { Outcome::Stay }
+            }
+            LinkState::Intro | LinkState::Linked { .. } | LinkState::Failed(_) => Outcome::Stay,
+        };
+
+        match outcome {
+            Outcome::Stay => {}
+            Outcome::Next(next) => self.modal = Some(Modal::Account(next)),
+            Outcome::Linked(link) => {
+                let (email, token) = (link.email.clone(), link.token.clone());
+                self.settings.account = Some(link);
+                self.settings.save();
+                let task = Task::spawn("import", Ok(0), move || api::import_history(&site, &token, &machine));
+                self.modal = Some(Modal::Account(LinkState::Importing { email, task }));
+            }
+            Outcome::Unlinked => {
+                self.settings.account = None;
+                self.settings.save();
+                self.modal = None;
+                self.toast = Some((self.t.acct_unlinked.to_string(), now));
+            }
+        }
+    }
+
+    fn machine_name(&self) -> String {
+        machine_name(self.hw.as_ref())
     }
 
     fn tick_feedback(&mut self) {
@@ -926,6 +1062,7 @@ impl App {
             return true;
         }
         let action = match key.code {
+            KeyCode::Char('a' | 'A') => Action::Account,
             KeyCode::Char('f' | 'F') => Action::Feedback,
             KeyCode::Char('s' | 'S') => Action::Support,
             KeyCode::Char('l' | 'L') => Action::Language,
@@ -1051,6 +1188,21 @@ impl App {
                 } else {
                     (Some(Modal::Feedback(fb)), action)
                 }
+            }
+            Modal::Account(state) => {
+                let action = match (&state, key.code) {
+                    (LinkState::Intro, KeyCode::Enter) => Some(Action::LinkStart),
+                    (LinkState::Failed(_), KeyCode::Enter) => Some(Action::LinkStart),
+                    (LinkState::Waiting { .. }, KeyCode::Char('o' | 'O')) => Some(Action::LinkOpenBrowser),
+                    (LinkState::Linked { .. }, KeyCode::Char('u' | 'U')) => Some(Action::Unlink),
+                    _ => None,
+                };
+                let close = match &state {
+                    LinkState::Unlinking(_) => false,
+                    LinkState::Linked { .. } => matches!(key.code, KeyCode::Esc | KeyCode::Enter),
+                    _ => key.code == KeyCode::Esc,
+                };
+                (if close { None } else { Some(Modal::Account(state)) }, action)
             }
             Modal::Pawnio { removing, error } => {
                 if removing.is_some() {
@@ -1184,6 +1336,32 @@ impl App {
                 self.open(&url);
             }
             Action::Help => self.modal = Some(Modal::Help),
+            Action::Account => {
+                self.modal = Some(Modal::Account(match &self.settings.account {
+                    Some(link) => LinkState::Linked { email: link.email.clone(), imported: None },
+                    None => LinkState::Intro,
+                }));
+            }
+            Action::LinkStart => {
+                let site = self.site.clone();
+                let task = Task::spawn("link-code", Err(ApiError::Connection("unexpected error".into())), move || {
+                    api::request_device_code(&site)
+                });
+                self.modal = Some(Modal::Account(LinkState::Requesting(task)));
+            }
+            Action::LinkOpenBrowser => {
+                if let Some(Modal::Account(LinkState::Waiting { code, .. })) = &self.modal {
+                    let url = code.approve_url(&self.site, &self.locale);
+                    self.open(&url);
+                }
+            }
+            Action::Unlink => {
+                if let Some(link) = self.settings.account.clone() {
+                    let site = self.site.clone();
+                    let task = Task::spawn("unlink", Ok(()), move || api::unlink(&site, &link.token));
+                    self.modal = Some(Modal::Account(LinkState::Unlinking(task)));
+                }
+            }
             Action::Language => {
                 let cursor = LANGUAGES.iter().position(|(c, _)| *c == self.locale).unwrap_or(0);
                 self.modal = Some(Modal::Language { cursor });
@@ -1501,8 +1679,9 @@ impl App {
         let Some(kind) = r.verdict.kind else { return };
         let payload = self.payload(r, kind);
         let site = self.site.clone();
+        let account = self.settings.account.as_ref().map(|a| a.token.clone());
         let task = Task::spawn("submit", Err(ApiError::Connection("unexpected error".into())), move || {
-            api::submit_results(&site, &payload)
+            api::submit_results(&site, &payload, account.as_deref())
         });
         self.results.as_mut().unwrap().submit = SubmitState::Sending(task);
     }
@@ -1812,6 +1991,13 @@ fn feedback_key(fb: &mut FeedbackForm, key: &KeyEvent) -> Option<Action> {
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
+}
+
+/// This PC as the website lists it under linked PCs: "DESKTOP-1A2B3C · Windows 11".
+pub fn machine_name(hw: Option<&HardwareInfo>) -> String {
+    let host = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+    let os = hw.and_then(|h| h.os.clone()).unwrap_or_default();
+    [host, os].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
 }
 
 /// Deterministic machine ID from hostname + CPU model (same as v1), so one

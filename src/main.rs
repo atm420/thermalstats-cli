@@ -85,6 +85,14 @@ struct Cli {
     /// Simulated temperatures, for trying the interface; never submits
     #[arg(long, hide = true)]
     demo: bool,
+
+    /// Link this PC to your ThermalStats account: results then save there automatically
+    #[arg(long, conflicts_with = "unlink")]
+    link: bool,
+
+    /// Unlink this PC from your ThermalStats account
+    #[arg(long)]
+    unlink: bool,
 }
 
 fn main() {
@@ -116,6 +124,11 @@ fn main() {
     if cli.detect_only {
         plain::detect_only();
         return;
+    }
+    if cli.link || cli.unlink {
+        let code = if cli.link { plain::link(&locale, &cli.api_url) } else { plain::unlink(&cli.api_url) };
+        platform::restore_process();
+        std::process::exit(code);
     }
 
     let opts = LaunchOptions {

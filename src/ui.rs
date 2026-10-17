@@ -333,6 +333,7 @@ fn draw_footer(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     if ctx.app.screen == Screen::Running {
         items.push(("Esc", t.btn_stop.to_string(), Action::StopTest));
     }
+    items.push(("A", t.key_account.to_string(), Action::Account));
     items.push(("F", t.key_feedback.to_string(), Action::Feedback));
     items.push(("S", format!("{} \u{2665}", t.key_support), Action::Support));
     items.push(("L", t.key_language.to_string(), Action::Language));
@@ -1420,8 +1421,11 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             ]));
             vec![]
         }
-        SubmitState::Done { url, .. } => {
+        SubmitState::Done { url, saved, .. } => {
             row(f, area, &mut y, Line::from(Span::styled(format!("● {}", t.submitted), Style::new().fg(OK).add_modifier(Modifier::BOLD))));
+            if let (true, Some(link)) = (*saved, &app.settings.account) {
+                row(f, area, &mut y, Line::from(Span::styled(format!("● {}", fill(t.res_saved, &[("email", &link.email)])), Style::new().fg(OK))));
+            }
             para(f, area, &mut y, Line::from(Span::raw(fill(t.view_results, &[("url", url)]))), 2);
             y += 1;
             draw_compare(f, app, area, &mut y, r);
@@ -1645,7 +1649,7 @@ fn draw_modal(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
         Modal::Help => {
             let text_w = width.saturating_sub(6);
             let body_h = wrapped_height(&Line::from(t.help_what), text_w)
-                + 11
+                + 12
                 + wrapped_height(&Line::from(t.help_mouse), text_w)
                 + wrapped_height(&Line::from(t.help_privacy), text_w);
             let inner = modal_frame(f, area, width, body_h + 6, t.help_title, ACCENT);
@@ -1654,10 +1658,11 @@ fn draw_modal(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             para(f, content, &mut y, Line::from(t.help_what), 0);
             y += 1;
             row(f, content, &mut y, section(t.help_keys));
-            let keys: [(&str, String); 8] = [
+            let keys: [(&str, String); 9] = [
                 ("Enter", t.help_key_enter.to_string()),
                 ("Esc", t.help_key_esc.to_string()),
                 ("Tab / arrows", t.help_key_move.to_string()),
+                ("A", t.key_account.to_string()),
                 ("F", t.key_feedback.to_string()),
                 ("S", t.key_support.to_string()),
                 ("L", t.key_language.to_string()),
@@ -1716,6 +1721,7 @@ fn draw_modal(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             draw_buttons(f, ctx, inner, by, &[btn("Enter", t.btn_save, Action::SaveDetails, true), btn("Esc", t.btn_cancel, Action::CloseModal, false)]);
         }
         Modal::Feedback(fb) => draw_feedback(f, ctx, area, width, fb),
+        Modal::Account(state) => draw_account(f, ctx, area, width.min(68), state),
         Modal::Pawnio { removing, error } => {
             let w = width.min(66);
             let body_h = wrapped_height(&Line::from(t.pawn_body), w.saturating_sub(6));
@@ -1735,6 +1741,89 @@ fn draw_modal(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
                     btn("U", t.btn_uninstall, Action::UninstallPawnio, false),
                 ]);
             }
+        }
+    }
+}
+
+/// The A key: link this PC to a ThermalStats account (see LinkState).
+fn draw_account(f: &mut Frame, ctx: &mut Ctx, area: Rect, width: u16, state: &LinkState) {
+    let app = ctx.app;
+    let t = &app.t;
+    let text_w = width.saturating_sub(6);
+    let busy = |f: &mut Frame, ctx: &mut Ctx, msg: &str| {
+        let inner = modal_frame(f, area, width, 5, t.acct_title, ACCENT);
+        let mut y = inner.y;
+        row(f, inner, &mut y, Line::from(vec![Span::styled(format!("{} ", pulse(app.frame)), Style::new().fg(ACCENT)), Span::raw(msg.to_string())]));
+        let _ = ctx;
+    };
+    match state {
+        LinkState::Intro => {
+            let h = wrapped_height(&Line::from(t.acct_intro), text_w) + 6;
+            let inner = modal_frame(f, area, width, h, t.acct_title, ACCENT);
+            let mut y = inner.y;
+            para(f, inner, &mut y, Line::from(t.acct_intro), 0);
+            let by = inner.bottom().saturating_sub(1);
+            draw_buttons(f, ctx, inner, by, &[
+                btn("Enter", t.acct_btn_link, Action::LinkStart, true),
+                btn("Esc", t.btn_close, Action::CloseModal, false),
+            ]);
+        }
+        LinkState::Requesting(_) => busy(f, ctx, t.acct_requesting),
+        LinkState::Importing { .. } => busy(f, ctx, t.acct_importing),
+        LinkState::Unlinking(_) => busy(f, ctx, t.acct_unlinking),
+        LinkState::Waiting { code, .. } => {
+            let url = code.approve_url(&app.site, &app.locale);
+            let h = wrapped_height(&Line::from(t.acct_waiting), text_w) + wrapped_height(&Line::from(url.as_str()), text_w) + 10;
+            let inner = modal_frame(f, area, width, h, t.acct_title, ACCENT);
+            let mut y = inner.y;
+            para(f, inner, &mut y, Line::from(t.acct_waiting), 0);
+            y += 1;
+            row(f, inner, &mut y, Line::from(Span::styled(
+                format!("  {}  ", code.display_code()),
+                Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            y += 1;
+            para(f, inner, &mut y, Line::from(Span::styled(url, Style::new().fg(MUTED))), 0);
+            y += 1;
+            row(f, inner, &mut y, Line::from(vec![
+                Span::styled(format!("{} ", pulse(app.frame)), Style::new().fg(ACCENT)),
+                Span::raw(t.acct_waiting_status),
+            ]));
+            let by = inner.bottom().saturating_sub(1);
+            draw_buttons(f, ctx, inner, by, &[
+                btn("O", t.acct_btn_open, Action::LinkOpenBrowser, false),
+                btn("Esc", t.btn_cancel, Action::CloseModal, false),
+            ]);
+        }
+        LinkState::Linked { email, imported } => {
+            let linked = fill(t.acct_linked, &[("email", email)]);
+            let extra = imported.filter(|n| *n > 0).map(|n| fill(t.acct_imported, &[("n", &n.to_string())]));
+            let h = wrapped_height(&Line::from(linked.as_str()), text_w.saturating_sub(2))
+                + extra.as_deref().map_or(0, |e| wrapped_height(&Line::from(e), text_w) + 1)
+                + 6;
+            let inner = modal_frame(f, area, width, h, t.acct_title, OK);
+            let mut y = inner.y;
+            para(f, inner, &mut y, Line::from(vec![Span::styled("● ", Style::new().fg(OK)), Span::raw(linked)]), 2);
+            if let Some(extra) = extra {
+                y += 1;
+                para(f, inner, &mut y, Line::from(Span::styled(extra, Style::new().fg(MUTED))), 0);
+            }
+            let by = inner.bottom().saturating_sub(1);
+            draw_buttons(f, ctx, inner, by, &[
+                btn("Enter", t.btn_close, Action::CloseModal, true),
+                btn("U", t.acct_btn_unlink, Action::Unlink, false),
+            ]);
+        }
+        LinkState::Failed(reason) => {
+            let h = wrapped_height(&Line::from(reason.as_str()), text_w) + 6;
+            let inner = modal_frame(f, area, width, h, t.acct_title, BAD);
+            let mut y = inner.y;
+            para(f, inner, &mut y, Line::from(Span::styled(reason.clone(), Style::new().fg(BAD))), 0);
+            let by = inner.bottom().saturating_sub(1);
+            draw_buttons(f, ctx, inner, by, &[
+                btn("Enter", t.btn_retry, Action::LinkStart, true),
+                btn("Esc", t.btn_close, Action::CloseModal, false),
+            ]);
         }
     }
 }
@@ -2034,7 +2123,7 @@ mod tests {
                     plan,
                     progress,
                     verdict: Verdict { kind: Some(crate::engine::TestKind::Both), cpu_ok: true, gpu_ok: true },
-                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into(), claim: None },
+                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into(), claim: None, saved: false },
                     compare: CompareState::Ready(Comparison {
                         cpu: Some(entry("AMD Ryzen 7 7800X3D", 64.0)),
                         gpu: Some(entry("NVIDIA GeForce RTX 4080 SUPER", 30.0)),
@@ -2100,6 +2189,54 @@ mod tests {
 
     /// Dump the running dashboard (sample data) as JSON cells for the website
     /// screenshot: SCREENSHOT_OUT=/path.json cargo test screenshot_dump -- --ignored
+    /// The account dialog (A) renders every state in every language at the
+    /// minimum and default console sizes, showing the code and the email.
+    #[test]
+    fn account_dialog_renders_every_state() {
+        use crate::api::{ApiError, DeviceCode};
+        for (locale, _) in crate::lang::LANGUAGES {
+            for (w, h) in [(80, 24), (120, 30)] {
+                let mut a = app(locale);
+                let states = [
+                    LinkState::Intro,
+                    LinkState::Requesting(Task::spawn("t", Err(ApiError::Connection("x".into())), || Err(ApiError::Connection("x".into())))),
+                    LinkState::Waiting {
+                        code: DeviceCode { device_code: "d".into(), user_code: "ABCDEFGH".into(), expires_in: 900, interval: 5 },
+                        poll: None,
+                        next_poll: Instant::now() + Duration::from_secs(3600),
+                        interval: Duration::from_secs(5),
+                        expires: Instant::now() + Duration::from_secs(900),
+                    },
+                    LinkState::Importing { email: "someone@example.com".into(), task: Task::spawn("t", Ok(0), || Ok(0)) },
+                    LinkState::Linked { email: "someone@example.com".into(), imported: Some(3) },
+                    LinkState::Unlinking(Task::spawn("t", Ok(()), || Ok(()))),
+                    LinkState::Failed("Couldn't reach ThermalStats".into()),
+                ];
+                for state in states {
+                    let waiting = matches!(state, LinkState::Waiting { .. });
+                    let linked = matches!(state, LinkState::Linked { .. });
+                    a.modal = Some(Modal::Account(state));
+                    let screen = render(&mut a, w, h).join("\n");
+                    if waiting {
+                        assert!(screen.contains("ABCD-EFGH"), "{locale} {w}x{h}: code missing");
+                        if locale == "en" && w == 80 {
+                            println!("{screen}");
+                        }
+                    }
+                    if linked {
+                        assert!(screen.contains("someone@example.com"), "{locale} {w}x{h}: email missing");
+                    }
+                }
+                a.modal = None;
+                if w == 120 {
+                    // Wide characters (Korean) take two cells: compare without spaces.
+                    let screen = render(&mut a, w, h).join("\n").replace(' ', "");
+                    assert!(screen.contains(&a.t.key_account.replace(' ', "")), "{locale}: footer has no account key");
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn screenshot_dump() {

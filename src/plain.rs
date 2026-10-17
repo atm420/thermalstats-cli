@@ -2,13 +2,86 @@
 //! --plain, when the output isn't a terminal (scripts, CI, redirected logs),
 //! or if the full-screen interface can't start.
 
-use crate::api::{self, SubmissionPayload};
-use crate::app::{machine_id, App, LaunchOptions, MIN_SUBMIT_SECS, VERSION};
+use crate::api::{self, ApiError, LinkPoll, SubmissionPayload};
+use crate::app::{machine_id, machine_name, App, LaunchOptions, MIN_SUBMIT_SECS, VERSION};
+use crate::settings::Settings;
 use crate::engine::{self, Phase, Session, TestKind, TestPlan};
 use crate::sensors::{Probe, SensorHub};
 use colored::Colorize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// --link: link this PC to a ThermalStats account, from a terminal.
+pub fn link(locale: &str, api_url: &str) -> i32 {
+    let site = api::site_root(api_url);
+    let hw = crate::hardware::detect_hardware();
+    let (machine, name) = (machine_id(&hw), machine_name(Some(&hw)));
+    let code = match api::request_device_code(&site) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Couldn't start linking:".red(), e);
+            return 1;
+        }
+    };
+    let url = code.approve_url(&site, locale);
+    println!("Link this PC to your ThermalStats account.\n");
+    println!("  Approve this code in your browser: {}", code.display_code().bold());
+    println!("  {}\n", url.cyan());
+    crate::platform::open_url(&url);
+    println!("{}", "Waiting for approval (Ctrl+C to cancel)...".dimmed());
+
+    let mut interval = Duration::from_secs(code.interval.clamp(1, 60));
+    let deadline = Instant::now() + Duration::from_secs(code.expires_in.clamp(60, 3600));
+    loop {
+        std::thread::sleep(interval);
+        if Instant::now() > deadline {
+            eprintln!("  {} The code expired. Run with --link again.", "✗".red());
+            return 1;
+        }
+        match api::poll_link(&site, &code, &name, &machine) {
+            Ok(LinkPoll::Pending) | Err(ApiError::Connection(_)) => {}
+            Ok(LinkPoll::SlowDown) => interval += Duration::from_secs(5),
+            Ok(LinkPoll::Linked(link)) => {
+                let (email, token) = (link.email.clone(), link.token.clone());
+                let mut settings = Settings::load();
+                settings.account = Some(link);
+                settings.save();
+                println!("  {} {}", "✓ Linked to".green(), email);
+                match api::import_history(&site, &token, &machine) {
+                    Ok(n) if n > 0 => println!("  Earlier results from this PC added to your account: {}", n),
+                    _ => {}
+                }
+                println!("  Results you submit from this PC now save to your account.");
+                return 0;
+            }
+            Ok(LinkPoll::Denied) => {
+                eprintln!("  {} The link was declined in the browser.", "✗".red());
+                return 1;
+            }
+            Ok(LinkPoll::Expired) => {
+                eprintln!("  {} The code expired. Run with --link again.", "✗".red());
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("  {} {}", "✗ Couldn't link:".red(), e);
+                return 1;
+            }
+        }
+    }
+}
+
+/// --unlink: forget the account link (and end it on the website).
+pub fn unlink(api_url: &str) -> i32 {
+    let mut settings = Settings::load();
+    let Some(link) = settings.account.take() else {
+        println!("This PC isn't linked to a ThermalStats account.");
+        return 0;
+    };
+    let _ = api::unlink(&api::site_root(api_url), &link.token);
+    settings.save();
+    println!("{} {}", "✓ This PC is no longer linked to".green(), link.email);
+    0
+}
 
 pub fn detect_only() {
     let hw = crate::hardware::detect_hardware();
@@ -193,10 +266,20 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
         change_type: None,
     };
     println!("\n{}", "Submitting results...".cyan());
-    match api::submit_results(&site, &payload) {
-        Ok(api::Submitted { id, claim_token, .. }) => {
+    let mut settings = Settings::load();
+    let account = settings.account.as_ref().map(|a| a.token.clone());
+    match api::submit_results(&site, &payload, account.as_deref()) {
+        Ok(api::Submitted { id, claim_token, saved, link_invalid, .. }) => {
             let url = api::page_url(&site, locale, &format!("/results/{}", id));
             println!("  {} {}", "✓ Submitted! View at:".green(), url.cyan());
+            if let (true, Some(link)) = (saved, &settings.account) {
+                println!("  {} {}", "✓ Saved to your account".green(), link.email);
+            }
+            if link_invalid {
+                settings.account = None;
+                settings.save();
+                println!("  This PC was unlinked from your account on the website. Run with --link to link it again.");
+            }
             crate::platform::open_url(&api::with_claim(&url, claim_token.as_deref()));
             0
         }

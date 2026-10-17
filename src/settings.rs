@@ -17,6 +17,17 @@ pub struct Settings {
     pub ambient_temp: Option<f64>,
     /// The last result this machine submitted: the "before" of a re-test.
     pub last_result: Option<LastResult>,
+    /// The ThermalStats account this PC is linked to (2.3+).
+    pub account: Option<AccountLink>,
+}
+
+/// A link to a ThermalStats account: results submitted with `token` save to
+/// that account. The token can be revoked from the website's Settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLink {
+    pub token: String,
+    pub email: String,
 }
 
 /// Enough of a submitted result to compare a re-test against it.

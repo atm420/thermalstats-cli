@@ -1,7 +1,9 @@
-//! ThermalStats web API: result submission, community comparison, feedback
-//! and debug logs. Blocking calls — the interface runs them on worker threads.
+//! ThermalStats web API: result submission, community comparison, feedback,
+//! debug logs and linking to an account. Blocking calls — the interface runs
+//! them on worker threads.
 
 use crate::series::Series;
+use crate::settings::AccountLink;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
@@ -52,27 +54,46 @@ fn client() -> Result<reqwest::blocking::Client, ApiError> {
         .map_err(|e| ApiError::Connection(e.to_string()))
 }
 
-fn post<T: Serialize>(url: &str, body: &T) -> Result<serde_json::Value, ApiError> {
-    let response = client()?
-        .post(url)
-        .json(body)
+/// Sends a request and returns the status and JSON body, whatever the status.
+/// `bearer` is the account install token of a linked CLI.
+fn send<T: Serialize>(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&T>,
+    bearer: Option<&str>,
+) -> Result<(u16, Option<serde_json::Value>, String), ApiError> {
+    let mut request = client()?.request(method, url);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .map_err(|e| ApiError::Connection(format!("Could not reach ThermalStats: {}", e)))?;
-
-    let status = response.status();
+    let status = response.status().as_u16();
     let text = response.text().unwrap_or_default();
-    let json: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    Ok((status, serde_json::from_str(&text).ok(), text))
+}
 
-    if !status.is_success() {
+/// The JSON body of a successful response, or the server's explanation.
+fn expect_ok(status: u16, json: Option<serde_json::Value>, text: String) -> Result<serde_json::Value, ApiError> {
+    if !(200..300).contains(&status) {
         let message = json
             .as_ref()
             .and_then(|v| v.get("error"))
             .and_then(|e| e.as_str())
             .map(String::from)
             .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(ApiError::Rejected { status: status.as_u16(), message });
+        return Err(ApiError::Rejected { status, message });
     }
     json.ok_or_else(|| ApiError::Connection("Unexpected response from ThermalStats".into()))
+}
+
+fn post<T: Serialize>(url: &str, body: &T) -> Result<serde_json::Value, ApiError> {
+    let (status, json, text) = send(reqwest::Method::POST, url, Some(body), None)?;
+    expect_ok(status, json, text)
 }
 
 fn id_of(json: &serde_json::Value) -> Result<String, ApiError> {
@@ -126,12 +147,21 @@ pub struct Submitted {
     /// account (2.2+, servers with accounts on). Only ever goes in the URL
     /// fragment of the page we open, never in a link we show or copy.
     pub claim_token: Option<String>,
+    /// Saved straight to the linked account (2.3+).
+    pub saved: bool,
+    /// We sent an account token, but the link was revoked on the website.
+    pub link_invalid: bool,
 }
 
-/// Submit a result; returns the new result's ID.
-pub fn submit_results(site: &str, payload: &SubmissionPayload) -> Result<Submitted, ApiError> {
-    let json = post(&format!("{}/api/submissions", site), payload)?;
+/// Submit a result; returns the new result's ID. With `account` (a linked
+/// CLI's install token) the server saves it to that account.
+pub fn submit_results(site: &str, payload: &SubmissionPayload, account: Option<&str>) -> Result<Submitted, ApiError> {
+    let (status, json, text) = send(reqwest::Method::POST, &format!("{}/api/submissions", site), Some(payload), account)?;
+    let json = expect_ok(status, json, text)?;
+    let flag = |key: &str| json.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(Submitted {
+        saved: flag("saved"),
+        link_invalid: flag("linkInvalid"),
         id: id_of(&json)?,
         baseline_id: json.get("baselineId").and_then(|v| v.as_str()).map(String::from),
         claim_token: json
@@ -140,6 +170,95 @@ pub fn submit_results(site: &str, payload: &SubmissionPayload) -> Result<Submitt
             .filter(|t| (20..=100).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
             .map(String::from),
     })
+}
+
+// ─── Account link (2.3+) ───────────────────────────────────────────
+//
+// The CLI shows a code; the user approves it on the website (signed in). The
+// CLI polls until then and receives an install token that it sends with each
+// submission, so results save to the account automatically.
+
+pub const CLI_CLIENT_ID: &str = "thermalstats-cli";
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    /// Seconds until the code expires.
+    pub expires_in: u64,
+    /// Seconds to wait between polls.
+    pub interval: u64,
+}
+
+impl DeviceCode {
+    /// "ABCDEFGH" → "ABCD-EFGH", as the website shows it.
+    pub fn display_code(&self) -> String {
+        let code: String = self.user_code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if code.len() == 8 { format!("{}-{}", &code[..4], &code[4..]) } else { code }
+    }
+
+    /// The page where the user approves this code.
+    pub fn approve_url(&self, site: &str, locale: &str) -> String {
+        page_url(site, locale, &format!("/account/link?user_code={}", self.display_code()))
+    }
+}
+
+/// Start linking: a code for the user to approve on the website.
+pub fn request_device_code(site: &str) -> Result<DeviceCode, ApiError> {
+    let json = post(&format!("{}/api/account/device/code", site), &serde_json::json!({ "client_id": CLI_CLIENT_ID }))?;
+    serde_json::from_value(json).map_err(|e| ApiError::Connection(e.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkPoll {
+    /// Not approved yet: ask again after the interval.
+    Pending,
+    /// Asked too often: wait longer.
+    SlowDown,
+    Linked(AccountLink),
+    Denied,
+    Expired,
+}
+
+/// Has the user approved the code yet? `name` labels this PC on the website.
+pub fn poll_link(site: &str, code: &DeviceCode, name: &str, machine_id: &str) -> Result<LinkPoll, ApiError> {
+    let body = serde_json::json!({ "device_code": code.device_code, "name": name, "machineId": machine_id });
+    let (status, json, text) = send(reqwest::Method::POST, &format!("{}/api/member/cli/token", site), Some(&body), None)?;
+    parse_link_poll(status, json.as_ref(), &text)
+}
+
+fn parse_link_poll(status: u16, json: Option<&serde_json::Value>, text: &str) -> Result<LinkPoll, ApiError> {
+    let field = |key: &str| json.and_then(|j| j.get(key)).and_then(|v| v.as_str()).map(String::from);
+    if (200..300).contains(&status) {
+        return match (field("token"), field("email")) {
+            (Some(token), Some(email)) => Ok(LinkPoll::Linked(AccountLink { token, email })),
+            _ => Err(ApiError::Connection("Unexpected response from ThermalStats".into())),
+        };
+    }
+    match field("error").as_deref() {
+        Some("authorization_pending") => Ok(LinkPoll::Pending),
+        Some("slow_down") => Ok(LinkPoll::SlowDown),
+        Some("access_denied") => Ok(LinkPoll::Denied),
+        Some("expired_token" | "invalid_grant") => Ok(LinkPoll::Expired),
+        _ => Err(ApiError::Rejected {
+            status,
+            message: field("error_description").or_else(|| field("error")).unwrap_or_else(|| text.chars().take(200).collect()),
+        }),
+    }
+}
+
+/// Saves this machine's earlier, unsaved results to the account; returns how many.
+pub fn import_history(site: &str, account: &str, machine_id: &str) -> Result<u64, ApiError> {
+    let body = serde_json::json!({ "machineId": machine_id });
+    let (status, json, text) = send(reqwest::Method::POST, &format!("{}/api/member/cli/import", site), Some(&body), Some(account))?;
+    let json = expect_ok(status, json, text)?;
+    Ok(json.get("imported").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// Ends the link on the website too (best effort: forgetting the token locally is what matters).
+pub fn unlink(site: &str, account: &str) -> Result<(), ApiError> {
+    let (status, json, text) = send::<()>(reqwest::Method::DELETE, &format!("{}/api/member/cli/link", site), None, Some(account))?;
+    expect_ok(status, json, text).map(|_| ())
 }
 
 /// The results URL to open in the browser: with the claim token in the
@@ -249,6 +368,31 @@ pub fn submit_debug_log(site: &str, payload: &DebugLogPayload) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_codes_display_like_the_website() {
+        let code = DeviceCode { device_code: "d".into(), user_code: "ABCDEFGH".into(), expires_in: 900, interval: 5 };
+        assert_eq!(code.display_code(), "ABCD-EFGH");
+        assert_eq!(code.approve_url("https://thermalstats.com", "fr"), "https://thermalstats.com/fr/account/link?user_code=ABCD-EFGH");
+        assert_eq!(code.approve_url("https://thermalstats.com", "en"), "https://thermalstats.com/account/link?user_code=ABCD-EFGH");
+    }
+
+    #[test]
+    fn reads_link_poll_answers() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(parse_link_poll(400, Some(&j(r#"{"error":"authorization_pending"}"#)), "").unwrap(), LinkPoll::Pending);
+        assert_eq!(parse_link_poll(400, Some(&j(r#"{"error":"slow_down"}"#)), "").unwrap(), LinkPoll::SlowDown);
+        assert_eq!(parse_link_poll(429, Some(&j(r#"{"error":"slow_down"}"#)), "").unwrap(), LinkPoll::SlowDown);
+        assert_eq!(parse_link_poll(400, Some(&j(r#"{"error":"access_denied"}"#)), "").unwrap(), LinkPoll::Denied);
+        assert_eq!(parse_link_poll(400, Some(&j(r#"{"error":"expired_token"}"#)), "").unwrap(), LinkPoll::Expired);
+        assert_eq!(parse_link_poll(400, Some(&j(r#"{"error":"invalid_grant"}"#)), "").unwrap(), LinkPoll::Expired);
+        assert_eq!(
+            parse_link_poll(201, Some(&j(r#"{"token":"tsc_x","email":"a@b.c"}"#)), "").unwrap(),
+            LinkPoll::Linked(AccountLink { token: "tsc_x".into(), email: "a@b.c".into() })
+        );
+        assert!(parse_link_poll(500, None, "oops").is_err());
+        assert!(parse_link_poll(201, Some(&j(r#"{"token":"tsc_x"}"#)), "").is_err());
+    }
 
     #[test]
     fn claim_token_only_goes_in_the_fragment() {
