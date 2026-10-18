@@ -5,7 +5,7 @@
 //! runs on worker threads and reports back through `Task` slots or shared
 //! state, so the event loop always keeps drawing.
 
-use crate::api::{self, ApiError, CompareRequest, Comparison, DeviceCode, FeedbackPayload, LinkPoll, SubmissionPayload, Submitted};
+use crate::api::{self, ApiError, BoardStanding, CompareRequest, Comparison, DeviceCode, FeedbackPayload, LinkPoll, RunRewards, SubmissionPayload, Submitted};
 use crate::engine::{self, Phase, Progress, Session, TestKind, TestPlan, Verdict};
 use crate::gpus::GpuDevice;
 use crate::hardware::HardwareInfo;
@@ -25,6 +25,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TOAST_FOR: Duration = Duration::from_secs(5);
 
 pub const DURATIONS: [u64; 5] = [30, 60, 120, 180, 300];
+/// Duration choices after DURATIONS: the ranked-run preset, then a custom length.
+pub const RANKED: usize = DURATIONS.len();
+pub const CUSTOM: usize = DURATIONS.len() + 1;
+/// A ranked run lasts 5 minutes and needs the room temperature and the cooler
+/// (or laptop) model, so the result is a full report: temperatures settle,
+/// it ranks reliably and earns the most XP.
+pub const RANKED_SECS: u64 = 300;
 /// Shorter tests are quick checks: the results are shown but never submitted.
 pub const MIN_SUBMIT_SECS: u64 = 60;
 pub const TEST_KINDS: [TestKind; 3] = [TestKind::Both, TestKind::Cpu, TestKind::Gpu];
@@ -171,7 +178,7 @@ impl Field {
 pub struct Form {
     /// Index into TEST_KINDS
     pub test: usize,
-    /// Index into DURATIONS, or DURATIONS.len() for "custom"
+    /// Index into DURATIONS, or RANKED, or CUSTOM
     pub duration: usize,
     pub custom_secs: TextInput,
     /// Index into COOLING
@@ -195,8 +202,9 @@ impl Form {
             .unwrap_or(TestKind::Both);
         let secs = opts.duration.or(settings.duration_secs).unwrap_or(120);
         let (duration, custom) = match DURATIONS.iter().position(|d| *d == secs) {
+            _ if opts.duration.is_none() && settings.ranked && secs == RANKED_SECS => (RANKED, String::new()),
             Some(i) => (i, String::new()),
-            None => (DURATIONS.len(), secs.to_string()),
+            None => (CUSTOM, secs.to_string()),
         };
         let cooling_value = opts.cooling_type.clone().or(settings.cooling_type.clone()).unwrap_or_default();
         let cooling = COOLING.iter().position(|c| *c == cooling_value).unwrap_or(COOLING.len());
@@ -237,7 +245,7 @@ impl Form {
                 fields.push(Field::Gpu);
             }
             fields.push(Field::Duration);
-            if self.duration == DURATIONS.len() {
+            if self.duration == CUSTOM {
                 fields.push(Field::CustomSecs);
             }
         }
@@ -265,7 +273,32 @@ impl Form {
     pub fn duration_secs(&self) -> Option<u64> {
         match DURATIONS.get(self.duration) {
             Some(d) => Some(*d),
+            None if self.ranked() => Some(RANKED_SECS),
             None => self.custom_secs.value.trim().parse().ok().filter(|s| (30..=3600).contains(s)),
+        }
+    }
+
+    pub fn ranked(&self) -> bool {
+        self.duration == RANKED
+    }
+
+    /// For a ranked run: the first detail still missing (room temperature,
+    /// then cooling), the same ones the website needs for a full report.
+    pub fn ranked_missing(&self, laptop: bool) -> Option<Field> {
+        if !self.ranked() {
+            return None;
+        }
+        if !matches!(self.ambient_celsius(), Ok(Some(_))) {
+            return Some(Field::Ambient);
+        }
+        if laptop {
+            return self.laptop_model.trimmed().is_none().then_some(Field::LaptopModel);
+        }
+        match COOLING.get(self.cooling) {
+            None | Some(&"unsure") => Some(Field::Cooling),
+            // A stock or passive cooler needs no model name.
+            Some(&"stock" | &"passive") => None,
+            Some(_) => self.cooler_model.trimmed().is_none().then_some(Field::CoolerModel),
         }
     }
 
@@ -317,7 +350,7 @@ impl Form {
         match field {
             Field::Test => TEST_KINDS.len(),
             Field::Gpu => gpu_count,
-            Field::Duration => DURATIONS.len() + 1,
+            Field::Duration => CUSTOM + 1,
             Field::Cooling => COOLING.len(),
             Field::Retest => CHANGE_TYPES.len() + 1,
             _ => 0,
@@ -368,7 +401,15 @@ pub enum SubmitState {
     Sending(Task<Result<Submitted, ApiError>>),
     /// `claim` opens the page with the token that lets the user save the
     /// result to an account; `url` (shown, copied, printed on exit) never has it.
-    Done { url: String, id: String, claim: Option<String>, saved: bool },
+    /// `standing` and `rewards` come from 2.4+ servers.
+    Done {
+        url: String,
+        id: String,
+        claim: Option<String>,
+        saved: bool,
+        standing: Option<BoardStanding>,
+        rewards: Option<RunRewards>,
+    },
     Failed { reason: String, retry: bool },
     /// Can't be submitted; the reason is shown.
     Blocked(String),
@@ -751,11 +792,13 @@ impl App {
                 let linked = result.as_ref().ok().map(|s| s.baseline_id.is_some());
                 let link_revoked = result.as_ref().is_ok_and(|s| s.link_invalid);
                 r.submit = match result {
-                    Ok(Submitted { id, claim_token, saved, .. }) => SubmitState::Done {
+                    Ok(Submitted { id, claim_token, saved, standing, rewards, .. }) => SubmitState::Done {
                         url: api::page_url(&self.site, &self.locale, &format!("/results/{}", id)),
                         id,
                         claim: claim_token,
                         saved,
+                        standing,
+                        rewards,
                     },
                     Err(ApiError::Connection(e)) => SubmitState::Failed { reason: e, retry: true },
                     // 429 = daily limit or duplicate: retrying won't help.
@@ -1524,6 +1567,11 @@ impl App {
             self.form.focus = Field::Cooling;
             return;
         }
+        if let Some(field) = self.form.ranked_missing(self.is_laptop()) {
+            self.form.error = Some(self.t.err_ranked.to_string());
+            self.form.focus = field;
+            return;
+        }
         if self.form.kind().gpu() && self.gpus().is_empty() {
             self.form.test = TEST_KINDS.iter().position(|k| *k == TestKind::Cpu).unwrap();
         }
@@ -1536,6 +1584,7 @@ impl App {
         let laptop = self.is_laptop();
         self.settings.test_type = Some(self.form.kind().as_str().to_string());
         self.settings.duration_secs = self.form.duration_secs();
+        self.settings.ranked = self.form.ranked();
         self.settings.gpu_name = self.selected_gpu().map(|g| g.name.clone());
         if laptop {
             self.settings.laptop_model = self.form.laptop_model.trimmed();
@@ -1668,6 +1717,7 @@ impl App {
             series: p.series.as_ref().map(|s| s.only(kind.cpu(), kind.gpu())),
             baseline_id: r.before.as_ref().map(|(b, _)| b.id.clone()),
             change_type: r.before.as_ref().map(|(_, c)| c.to_string()),
+            lang: Some(self.locale.clone()),
         }
     }
 
@@ -2135,9 +2185,64 @@ mod tests {
     }
 
     #[test]
+    fn ranked_runs_need_room_temperature_and_cooler_details() {
+        let pick = |c: &str| COOLING.iter().position(|x| *x == c).unwrap();
+        let mut app = app_on("AMD Ryzen 5 5600X", false, None);
+        app.form.duration = RANKED;
+        assert_eq!(app.form.duration_secs(), Some(RANKED_SECS));
+        app.form.cooling = pick("air");
+
+        app.confirm_options();
+        assert_eq!(app.form.error.as_deref(), Some(app.t.err_ranked));
+        assert_eq!(app.form.focus, Field::Ambient);
+        app.form.ambient = TextInput::new("22", 8);
+        app.confirm_options();
+        assert_eq!(app.form.focus, Field::CoolerModel, "an air cooler needs its model");
+        app.form.cooling = pick("unsure");
+        app.confirm_options();
+        assert_eq!(app.form.focus, Field::Cooling, "not sure isn't enough for a full report");
+        app.form.cooling = pick("stock");
+        app.confirm_options();
+        assert_eq!(app.screen, Screen::Confirm, "stock coolers need no model");
+        assert!(app.settings.ranked);
+        assert_eq!(app.settings.duration_secs, Some(RANKED_SECS));
+
+        // The same 5 minutes without the preset needs none of it.
+        let mut plain = app_on("AMD Ryzen 5 5600X", false, None);
+        plain.form.duration = DURATIONS.iter().position(|d| *d == RANKED_SECS).unwrap();
+        plain.form.cooling = pick("air");
+        plain.confirm_options();
+        assert_eq!(plain.screen, Screen::Confirm);
+
+        // Laptops need their model.
+        let mut laptop = app_on("Intel Core i7-13700H", true, None);
+        laptop.form.duration = RANKED;
+        laptop.form.ambient = TextInput::new("72f", 8);
+        laptop.confirm_options();
+        assert_eq!(laptop.form.focus, Field::LaptopModel);
+        laptop.form.laptop_model = TextInput::new("Legion 5", 120);
+        laptop.confirm_options();
+        assert_eq!(laptop.screen, Screen::Confirm);
+    }
+
+    #[test]
+    fn the_ranked_preset_is_remembered() {
+        let settings = Settings { ranked: true, duration_secs: Some(RANKED_SECS), ..Default::default() };
+        assert!(Form::new(&settings, &opts()).ranked());
+        // Without the flag (older settings), 5 minutes is the plain 5-minute choice.
+        let settings = Settings { duration_secs: Some(RANKED_SECS), ..Default::default() };
+        assert_eq!(Form::new(&settings, &opts()).duration, DURATIONS.iter().position(|d| *d == RANKED_SECS).unwrap());
+        // A --duration on the command line wins.
+        let settings = Settings { ranked: true, duration_secs: Some(RANKED_SECS), ..Default::default() };
+        let mut o = opts();
+        o.duration = Some(RANKED_SECS);
+        assert!(!Form::new(&settings, &o).ranked());
+    }
+
+    #[test]
     fn custom_duration_bounds() {
         let mut form = Form::new(&Settings::default(), &opts());
-        form.duration = DURATIONS.len();
+        form.duration = CUSTOM;
         form.custom_secs = TextInput::new("29", 4);
         assert_eq!(form.duration_secs(), None);
         form.custom_secs = TextInput::new("90", 4);

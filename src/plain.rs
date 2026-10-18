@@ -264,16 +264,29 @@ fn run_inner(locale: &str, opts: &LaunchOptions) -> i32 {
         // Before/after re-tests are offered in the interactive interface only.
         baseline_id: None,
         change_type: None,
+        lang: Some(locale.to_string()),
     };
     println!("\n{}", "Submitting results...".cyan());
     let mut settings = Settings::load();
     let account = settings.account.as_ref().map(|a| a.token.clone());
     match api::submit_results(&site, &payload, account.as_deref()) {
-        Ok(api::Submitted { id, claim_token, saved, link_invalid, .. }) => {
+        Ok(api::Submitted { id, claim_token, saved, link_invalid, standing, rewards, .. }) => {
             let url = api::page_url(&site, locale, &format!("/results/{}", id));
             println!("  {} {}", "✓ Submitted! View at:".green(), url.cyan());
             if let (true, Some(link)) = (saved, &settings.account) {
                 println!("  {} {}", "✓ Saved to your account".green(), link.email);
+            }
+            if let Some(s) = standing {
+                println!("  {} {}", if s.ranked { "★".cyan() } else { "○".dimmed() }, s.text);
+                for tip in &s.tips {
+                    println!("    {}", format!("· {}", tip).dimmed());
+                }
+            }
+            if let Some(r) = rewards {
+                println!("  {} +{} XP · {} XP in total · {}", "★".green(), r.xp, r.total_xp, r.level);
+                if !r.badges.is_empty() {
+                    println!("  {} New badges: {}", "★".green(), r.badges.join(", "));
+                }
             }
             if link_invalid {
                 settings.account = None;

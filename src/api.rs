@@ -136,6 +136,57 @@ pub struct SubmissionPayload {
     pub baseline_id: Option<String>,
     /// What changed since the baseline, one of `app::CHANGE_TYPES`.
     pub change_type: Option<String>,
+    /// Language of the leaderboard text the server sends back (2.4+).
+    pub lang: Option<String>,
+}
+
+/// Where this run stands on its model's leaderboard, or why it isn't ranked
+/// (2.4+ servers). The text comes ready to print in the CLI's language.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BoardStanding {
+    pub ranked: bool,
+    pub text: String,
+    /// Not ranked: what to do differently next time.
+    #[serde(default)]
+    pub tips: Vec<String>,
+}
+
+/// What the run earned the linked account (2.4+ servers).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRewards {
+    pub xp: i64,
+    pub total_xp: i64,
+    /// The account's level name, in the CLI's language.
+    pub level: String,
+    /// Badges this run unlocked, by name.
+    #[serde(default)]
+    pub badges: Vec<String>,
+}
+
+/// Server text for the terminal: no control characters (so no escape
+/// sequences), one line, at most `max` characters.
+fn printable(text: &str, max: usize) -> String {
+    let line: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).take(max).collect();
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl BoardStanding {
+    fn cleaned(self) -> Option<Self> {
+        let text = printable(&self.text, 240);
+        let tips = self.tips.iter().map(|t| printable(t, 240)).filter(|t| !t.is_empty()).take(3).collect();
+        (!text.is_empty()).then_some(BoardStanding { ranked: self.ranked, text, tips })
+    }
+}
+
+impl RunRewards {
+    fn cleaned(self) -> Self {
+        RunRewards {
+            level: printable(&self.level, 40),
+            badges: self.badges.iter().map(|b| printable(b, 60)).filter(|b| !b.is_empty()).take(10).collect(),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,18 +202,29 @@ pub struct Submitted {
     pub saved: bool,
     /// We sent an account token, but the link was revoked on the website.
     pub link_invalid: bool,
+    /// Leaderboard standing (2.4+ servers with accounts on).
+    pub standing: Option<BoardStanding>,
+    /// XP and badges, for a linked CLI (2.4+).
+    pub rewards: Option<RunRewards>,
 }
 
 /// Submit a result; returns the new result's ID. With `account` (a linked
 /// CLI's install token) the server saves it to that account.
 pub fn submit_results(site: &str, payload: &SubmissionPayload, account: Option<&str>) -> Result<Submitted, ApiError> {
     let (status, json, text) = send(reqwest::Method::POST, &format!("{}/api/submissions", site), Some(payload), account)?;
-    let json = expect_ok(status, json, text)?;
+    parse_submitted(&expect_ok(status, json, text)?)
+}
+
+fn parse_submitted(json: &serde_json::Value) -> Result<Submitted, ApiError> {
     let flag = |key: &str| json.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    // Anything unexpected in the newer fields is ignored, not an error.
+    let field = |key: &str| json.get(key).cloned().filter(|v| v.is_object());
     Ok(Submitted {
         saved: flag("saved"),
         link_invalid: flag("linkInvalid"),
-        id: id_of(&json)?,
+        id: id_of(json)?,
+        standing: field("standing").and_then(|v| serde_json::from_value::<BoardStanding>(v).ok()).and_then(BoardStanding::cleaned),
+        rewards: field("rewards").and_then(|v| serde_json::from_value::<RunRewards>(v).ok()).map(RunRewards::cleaned),
         baseline_id: json.get("baselineId").and_then(|v| v.as_str()).map(String::from),
         claim_token: json
             .get("claimToken")
@@ -416,6 +478,33 @@ mod tests {
         // Older servers: no standing.
         let c: Comparison = serde_json::from_str(r#"{"cpu":{"model":"X","count":3,"scope":"exact","avgLoad":60}}"#).unwrap();
         assert!(c.cpu.unwrap().standing.is_none());
+    }
+
+    #[test]
+    fn reads_standing_and_rewards_from_submit_replies() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let s = parse_submitted(&j(r#"{"id":"abc","standing":{"ranked":true,"text":"Ce PC est 3e sur 10 au classement AMD Ryzen 5 5600X.","position":3,"of":10,"model":"AMD Ryzen 5 5600X"},
+            "rewards":{"xp":25,"totalXp":415,"level":"AIO 240","badges":["Endurance","Collector (Bronze)"]}}"#)).unwrap();
+        let standing = s.standing.unwrap();
+        assert!(standing.ranked);
+        assert_eq!(standing.text, "Ce PC est 3e sur 10 au classement AMD Ryzen 5 5600X.");
+        assert!(standing.tips.is_empty());
+        assert_eq!(s.rewards.unwrap(), RunRewards { xp: 25, total_xp: 415, level: "AIO 240".into(), badges: vec!["Endurance".into(), "Collector (Bronze)".into()] });
+
+        // Not ranked, with tips; at most three, one line each, no escape sequences.
+        let s = parse_submitted(&j(r#"{"id":"abc","standing":{"ranked":false,"text":"Not ranked\u001b[31m yet.\n","tips":["a","b\r\nc","","d","e"]}}"#)).unwrap();
+        let standing = s.standing.unwrap();
+        assert_eq!(standing.text, "Not ranked [31m yet.");
+        assert_eq!(standing.tips, vec!["a", "b c", "d"]);
+        assert!(s.rewards.is_none());
+
+        // Older servers send neither; odd values are ignored.
+        let s = parse_submitted(&j(r#"{"id":"abc"}"#)).unwrap();
+        assert!(s.standing.is_none() && s.rewards.is_none());
+        let s = parse_submitted(&j(r#"{"id":"abc","standing":"x","rewards":{"xp":"lots"}}"#)).unwrap();
+        assert!(s.standing.is_none() && s.rewards.is_none());
+        let s = parse_submitted(&j(r#"{"id":"abc","standing":{"ranked":false,"text":"  "}}"#)).unwrap();
+        assert!(s.standing.is_none());
     }
 
     #[test]

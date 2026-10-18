@@ -700,12 +700,14 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
                         }
                     })
                     .collect();
+                chips.push(format!("{} ({})", t.dur_ranked, app.format_duration(RANKED_SECS)));
                 chips.push(t.dur_custom.to_string());
                 let rows = chips_row(f, ctx, Rect::new(x, y, w, area.bottom() - y), &chips, form.duration, focused, field);
+                let hint = if form.ranked() { t.ranked_hint } else { t.duration_hint };
                 if focused && y + rows < area.bottom() {
-                    let hint_rows = wrapped_height(&Line::from(t.duration_hint), w);
+                    let hint_rows = wrapped_height(&Line::from(hint), w);
                     f.render_widget(
-                        Paragraph::new(Span::styled(t.duration_hint, Style::new().fg(DIM))).wrap(Wrap { trim: true }),
+                        Paragraph::new(Span::styled(hint, Style::new().fg(DIM))).wrap(Wrap { trim: true }),
                         Rect::new(x, y + rows, w, hint_rows.min(area.bottom() - y - rows)),
                     );
                     rows + hint_rows
@@ -729,9 +731,32 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
                 }
             }
             Field::CustomSecs => text_field(f, ctx, Rect::new(x, y, 12.min(w), 1), &form.custom_secs, t.ph_custom_secs, focused, field),
-            Field::CoolerModel => text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.cooler_model, t.ph_cooler, focused, field),
-            Field::LaptopModel => text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.laptop_model, t.ph_laptop, focused, field),
-            Field::Ambient => text_field(f, ctx, Rect::new(x, y, 34.min(w), 1), &form.ambient, t.ph_ambient, focused, field),
+            Field::CoolerModel => {
+                // A ranked run needs the model, unless the cooler is stock or passive.
+                let needed = form.ranked() && !matches!(COOLING.get(form.cooling), Some(&"stock" | &"passive"));
+                let ph = if needed { required(t.ph_cooler) } else { t.ph_cooler };
+                text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.cooler_model, ph, focused, field)
+            }
+            Field::LaptopModel => {
+                let ph = if form.ranked() { required(t.ph_laptop) } else { t.ph_laptop };
+                text_field(f, ctx, Rect::new(x, y, 44.min(w), 1), &form.laptop_model, ph, focused, field)
+            }
+            Field::Ambient => {
+                let ph = if form.ranked() { required(t.ph_ambient) } else { t.ph_ambient };
+                let rows = text_field(f, ctx, Rect::new(x, y, 34.min(w), 1), &form.ambient, ph, focused, field);
+                // Why it's asked. Not with an error (it says what's missing), and
+                // only with room left for the key hint and buttons below.
+                let hint_rows = wrapped_height(&Line::from(t.ambient_hint), w);
+                if focused && form.error.is_none() && y + rows + hint_rows + 4 <= area.bottom() {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(t.ambient_hint, Style::new().fg(DIM))).wrap(Wrap { trim: true }),
+                        Rect::new(x, y + rows, w, hint_rows.min(area.bottom() - y - rows)),
+                    );
+                    rows + hint_rows
+                } else {
+                    rows
+                }
+            }
             Field::Retest => {
                 let mut chips = vec![t.retest_none.to_string()];
                 chips.extend(CHANGE_TYPES.iter().map(|c| app.change_label(c).to_string()));
@@ -754,6 +779,11 @@ fn draw_form_fields(f: &mut Frame, ctx: &mut Ctx, area: Rect, mut y: u16, form: 
         y += rows.max(1);
     }
     y
+}
+
+/// A placeholder without its "(optional)" ending, for a field a ranked run needs.
+fn required(placeholder: &str) -> &str {
+    placeholder.rsplit_once(" (").map_or(placeholder, |(example, _)| example)
 }
 
 /// Radio choices, wrapping as needed. Returns rows used.
@@ -841,6 +871,9 @@ fn draw_confirm(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     row(f, area, &mut y, section(t.confirm_title));
 
     let mut plan = format!("{}  ·  {}", app.kind_label(kind), duration);
+    if app.form.ranked() {
+        plan.push_str(&format!("  ·  {}", t.dur_ranked));
+    }
     if kind.gpu() {
         if let Some(g) = app.selected_gpu() {
             plan.push_str(&format!("  ·  {}", g.name));
@@ -865,6 +898,9 @@ fn draw_confirm(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             bullets.push((t.hu_quick.to_string(), WARN));
         } else {
             bullets.push((format!("{} {}", t.hu_auto_submit, t.submit_what), Color::Reset));
+        }
+        if app.form.ranked() {
+            bullets.push((t.hu_ranked.to_string(), Color::Reset));
         }
     }
     if let (Some(change), Some(b)) = (app.form.change_type(), &app.form.baseline) {
@@ -1421,11 +1457,12 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
             ]));
             vec![]
         }
-        SubmitState::Done { url, saved, .. } => {
+        SubmitState::Done { url, saved, standing, rewards, .. } => {
             row(f, area, &mut y, Line::from(Span::styled(format!("● {}", t.submitted), Style::new().fg(OK).add_modifier(Modifier::BOLD))));
             if let (true, Some(link)) = (*saved, &app.settings.account) {
                 row(f, area, &mut y, Line::from(Span::styled(format!("● {}", fill(t.res_saved, &[("email", &link.email)])), Style::new().fg(OK))));
             }
+            draw_standing(f, app, area, &mut y, standing.as_ref(), rewards.as_ref());
             para(f, area, &mut y, Line::from(Span::raw(fill(t.view_results, &[("url", url)]))), 2);
             y += 1;
             draw_compare(f, app, area, &mut y, r);
@@ -1463,6 +1500,28 @@ fn draw_results(f: &mut Frame, ctx: &mut Ctx, area: Rect) {
     if !buttons.is_empty() {
         let by = (y + 1).min(area.bottom().saturating_sub(1));
         draw_buttons(f, ctx, area, by, &buttons);
+    }
+}
+
+/// The leaderboard line from the server (or why the run isn't ranked, with
+/// tips), and what a linked account earned.
+fn draw_standing(f: &mut Frame, app: &App, area: Rect, y: &mut u16, standing: Option<&crate::api::BoardStanding>, rewards: Option<&crate::api::RunRewards>) {
+    let t = &app.t;
+    if let Some(s) = standing {
+        let (mark, color) = if s.ranked { ("★", ACCENT) } else { ("○", MUTED) };
+        para(f, area, y, Line::from(vec![Span::styled(format!("{} ", mark), Style::new().fg(color)), Span::styled(s.text.clone(), Style::new().fg(color))]), 0);
+        // Tips only with room to spare for the link, comparison and buttons.
+        let room = area.bottom().saturating_sub(*y);
+        for tip in s.tips.iter().take(if room > 10 { 2 } else { 0 }) {
+            para(f, area, y, Line::from(Span::styled(format!("· {}", tip), Style::new().fg(DIM))), 2);
+        }
+    }
+    if let Some(r) = rewards {
+        let xp = fill(t.res_xp, &[("xp", &r.xp.to_string()), ("total", &r.total_xp.to_string()), ("level", &r.level)]);
+        row(f, area, y, Line::from(Span::styled(format!("★ {}", xp), Style::new().fg(OK))));
+        if !r.badges.is_empty() {
+            para(f, area, y, Line::from(Span::styled(format!("★ {}", fill(t.res_badges, &[("badges", &r.badges.join(", "))])), Style::new().fg(OK).add_modifier(Modifier::BOLD))), 0);
+        }
     }
 }
 
@@ -2123,7 +2182,14 @@ mod tests {
                     plan,
                     progress,
                     verdict: Verdict { kind: Some(crate::engine::TestKind::Both), cpu_ok: true, gpu_ok: true },
-                    submit: SubmitState::Done { url: "https://thermalstats.com/results/abc".into(), id: "abc".into(), claim: None, saved: false },
+                    submit: SubmitState::Done {
+                        url: "https://thermalstats.com/results/abc".into(),
+                        id: "abc".into(),
+                        claim: None,
+                        saved: false,
+                        standing: None,
+                        rewards: None,
+                    },
                     compare: CompareState::Ready(Comparison {
                         cpu: Some(entry("AMD Ryzen 7 7800X3D", 64.0)),
                         gpu: Some(entry("NVIDIA GeForce RTX 4080 SUPER", 30.0)),
@@ -2135,6 +2201,109 @@ mod tests {
                 let results = render(&mut a, w, h);
                 if preview && ((w == 120 && locale == "en") || (w == 80 && locale == "de")) {
                     for screen in [options, confirm, results] {
+                        println!("{}\n{}", "=".repeat(w as usize), screen.join("\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ranked-run preset (2.4): its chip and hint, the error and room
+    /// temperature hint when details are missing, the confirm note, and the
+    /// results with the server's leaderboard line, tips, XP and badges.
+    /// PREVIEW_RANKED=1 cargo test ranked_screens -- --nocapture prints them.
+    #[test]
+    fn ranked_screens_render_in_all_languages() {
+        use crate::api::{BoardStanding, RunRewards};
+        use crate::engine::{Part, Phase, Progress, Verdict};
+        use crate::settings::AccountLink;
+        use crate::stress::{GpuStress, StressStatus};
+        let preview = std::env::var("PREVIEW_RANKED").is_ok();
+        for (locale, _) in crate::lang::LANGUAGES {
+            for (w, h) in [(80, 24), (120, 30)] {
+                let mut a = app(locale);
+                a.form.duration = RANKED;
+                a.form.cooling = COOLING.iter().position(|c| *c == "air").unwrap();
+                a.form.focus = Field::Duration;
+                a.screen = Screen::Options;
+                let options = render(&mut a, w, h);
+                a.act(Action::Continue);
+                assert_eq!(a.screen, Screen::Options, "{locale}: started a ranked run without room temperature");
+                let missing = render(&mut a, w, h);
+                let first = a.t.err_ranked.split_whitespace().next().unwrap();
+                // Wide characters (Korean) take two cells: compare without spaces.
+                assert!(missing.join("").replace(' ', "").contains(&format!("▲{}", first)), "{locale} {w}x{h}: error hidden\n{}", missing.join("\n"));
+                a.form.ambient = TextInput::new("22", 8);
+                a.form.cooler_model = TextInput::new("Noctua NH-D15", 120);
+                a.act(Action::Continue);
+                assert_eq!(a.screen, Screen::Confirm, "{locale}");
+                let confirm = render(&mut a, w, h);
+
+                let progress = Progress {
+                    phase: Phase::Finished,
+                    started: None,
+                    ends: None,
+                    ends_wall: None,
+                    stopped: None,
+                    cpu: Part { idle: Some(41.0), peak: Some(80.2), usage_max: Some(100.0), ..Default::default() },
+                    gpu: Part { idle: Some(35.0), peak: Some(76.5), usage_max: Some(99.0), ..Default::default() },
+                    stress: StressStatus { cpu_threads: 16, gpu: GpuStress::Off },
+                    warnings: Vec::new(),
+                    stopped_early: false,
+                    series: None,
+                };
+                let results_with = |a: &mut App, standing: BoardStanding, rewards: Option<RunRewards>| {
+                    a.results = Some(ResultsState {
+                        plan: TestPlan { kind: crate::engine::TestKind::Both, duration: Duration::from_secs(RANKED_SECS), gpu: a.selected_gpu().cloned() },
+                        progress: progress.clone(),
+                        verdict: Verdict { kind: Some(crate::engine::TestKind::Both), cpu_ok: true, gpu_ok: true },
+                        submit: SubmitState::Done {
+                            url: "https://thermalstats.com/results/abc".into(),
+                            id: "abc".into(),
+                            claim: None,
+                            saved: rewards.is_some(),
+                            standing: Some(standing),
+                            rewards,
+                        },
+                        compare: CompareState::Idle,
+                        before: None,
+                        unlinked: false,
+                    });
+                    a.screen = Screen::Results;
+                    render(a, w, h)
+                };
+                a.settings.account = Some(AccountLink { token: "tsc_x".into(), email: "me@example.com".into() });
+                let ranked = results_with(
+                    &mut a,
+                    BoardStanding { ranked: true, text: "This PC is #3 of 10 on the AMD Ryzen 5 5600X leaderboard.".into(), tips: vec![] },
+                    Some(RunRewards { xp: 25, total_xp: 415, level: "AIO 240".into(), badges: vec!["Endurance".into(), "Collector (Bronze)".into()] }),
+                );
+                a.settings.account = None;
+                let unranked = results_with(
+                    &mut a,
+                    BoardStanding {
+                        ranked: false,
+                        text: "This run isn't on the leaderboard.".into(),
+                        tips: vec!["Run the test for 2 minutes or more.".into(), "Let temperatures settle before it ends.".into()],
+                    },
+                    None,
+                );
+                // Every language's placeholders end in "(optional)" for `required` to drop.
+                for ph in [a.t.ph_ambient, a.t.ph_cooler, a.t.ph_laptop] {
+                    assert!(ph.ends_with(')') && required(ph) != ph && !required(ph).contains('('), "{locale}: {ph}");
+                }
+                if locale == "en" {
+                    let [o, m, r] = [options.join("\n"), missing.join("\n"), ranked.join("\n")];
+                    assert!(o.contains("Ranked run (5 min)"), "{o}");
+                    assert!(m.contains("A ranked run needs") && !m.contains("(optional)"), "{m}");
+                    assert!(r.contains("#3 of 10") && r.contains("+25 XP") && r.contains("Badges earned: Endurance"), "{r}");
+                }
+                if w == 120 && locale == "en" {
+                    let u = unranked.join("\n");
+                    assert!(u.contains("· Run the test for 2 minutes or more."), "{u}");
+                }
+                if preview && ((w == 120 && locale == "en") || (w == 80 && locale == "fr")) {
+                    for screen in [options, missing, confirm, ranked, unranked] {
                         println!("{}\n{}", "=".repeat(w as usize), screen.join("\n"));
                     }
                 }

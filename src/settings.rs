@@ -10,6 +10,8 @@ pub struct Settings {
     pub lang: Option<String>,
     pub test_type: Option<String>,
     pub duration_secs: Option<u64>,
+    /// The ranked-run preset was chosen (2.4+).
+    pub ranked: bool,
     pub gpu_name: Option<String>,
     pub cooling_type: Option<String>,
     pub cooling_model: Option<String>,
